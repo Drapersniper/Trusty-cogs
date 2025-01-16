@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import aiohttp
 import discord
 from red_commons.logging import getLogger
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
+from redbot.core.utils.chat_formatting import box
 from redbot.vendored.discord.ext import menus
 from tabulate import tabulate
+from yarl import URL
 
 from .components import (
     BackButton,
@@ -24,10 +26,12 @@ from .components import (
     TeamButton,
 )
 from .constants import BASE_URL, TEAMS
-from .helper import ACTIVE_TEAM_RE, Conferences, Divisions, utc_to_local
+from .helper import ACTIVE_TEAM_RE, Conferences, Divisions, Team, utc_to_local
 
 if TYPE_CHECKING:
     from redbot.core import Config, commands
+
+    from .api import NewAPI
 
 _ = Translator("Hockey", __file__)
 
@@ -39,12 +43,11 @@ class StreakType(Enum):
     wins = "wins"
     losses = "losses"
 
-
-@dataclass
-class Team:
-    id: int
-    name: str
-    link: str
+    @classmethod
+    def from_code(cls, code: str) -> StreakType:
+        return {"W": StreakType.wins, "L": StreakType.losses, "OT": StreakType.ot}.get(
+            code, StreakType.wins
+        )
 
 
 @dataclass
@@ -62,7 +65,10 @@ class Streak:
     streakCode: str
 
     def __init__(self, *args, **kwargs):
-        self.streakType = StreakType(kwargs["streakType"])
+        try:
+            self.streakType = StreakType(kwargs["streakType"])
+        except ValueError:
+            self.streakType = StreakType.from_code(kwargs["streakCode"])
         self.streakNumber = int(kwargs["streakNumber"])
         self.streakCode = kwargs["streakCode"]
 
@@ -94,211 +100,142 @@ class Conference:
         )
 
 
-class RoundNames(NamedTuple):
-    name: str
-    shortName: str
-
-
-class SeriesNames(NamedTuple):
-    matchupName: str
-    matchupShortName: str
-    teamAbbreviationA: str
-    teamAbbreviationB: str
-    seriesSlug: Optional[str]
-
-    @classmethod
-    def from_json(cls, data: dict) -> SeriesNames:
-        return cls(
-            matchupName=data.get("matchupName", None),
-            matchupShortName=data.get("matchupShortName", None),
-            teamAbbreviationA=data.get("teamAbbreviationA", None),
-            teamAbbreviationB=data.get("teamAbbreviationB", None),
-            seriesSlug=data.get("seriesSlug", None),
-        )
-
-
-class SeriesRound(NamedTuple):
-    number: int
-
-
-@dataclass
-class Format:
-    name: str
-    description: str
-    numberOfGames: int
-    numberOfWins: int
-
-
-@dataclass
-class Summary:
-    gamePk: Optional[int]
-    gameNumber: int
-    gameLabel: Optional[str]
-    necessary: Optional[bool]
-    gameCode: Optional[int]
-    gameTime: Optional[datetime]
-    seriesStatus: Optional[str]
-    seriesStatusShort: Optional[str]
-
-    @classmethod
-    def from_json(cls, data: dict) -> Summary:
-        game_time = data.get("gameTime", None)
-        if game_time is not None:
-            game_time = datetime.strptime(game_time, "%Y-%m-%dT%H:%M:%SZ")
-            game_time = game_time.replace(tzinfo=timezone.utc)
-        return cls(
-            gamePk=data.get("gamePk", None),
-            gameNumber=data.get("gameNumber", 0),
-            gameLabel=data.get("gameLabel", None),
-            necessary=data.get("necessary", None),
-            gameCode=data.get("gameCode", None),
-            gameTime=game_time,
-            seriesStatus=data.get("seriesStatus", None),
-            seriesStatusShort=data.get("seriesStatusShort", None),
-        )
-
-
-@dataclass
-class CurrentGame:
-    seriesSummary: Summary
-
-    @classmethod
-    def from_json(cls, data: dict) -> CurrentGame:
-        return cls(seriesSummary=Summary.from_json(data["seriesSummary"]))
-
-
-@dataclass
-class Seed:
-    type: str
-    rank: int
-    isTop: bool
-
-    @classmethod
-    def from_json(cls, data: dict) -> Seed:
-        return cls(
-            type=data.get("type", None), rank=data.get("rank", None), isTop=data.get("isTop", None)
-        )
-
-
-class SeriesRecord(NamedTuple):
-    wins: int
-    losses: int
-
-
-@dataclass
-class TeamMatchup:
-    team: Team
-    seed: Seed
-    seriesRecord: SeriesRecord
-
-    @classmethod
-    def from_json(cls, data: dict) -> TeamMatchup:
-        return cls(
-            team=Team(**data["team"]),
-            seed=Seed.from_json(data["seed"]),
-            seriesRecord=SeriesRecord(**data["seriesRecord"]),
-        )
-
-
-@dataclass
-class Series:
-    seriesNumber: Optional[int]
-    seriesCode: str
-    names: SeriesNames
-    currentGame: CurrentGame
-    conference: Conference
-    round: SeriesRound
-    matchupTeams: List[TeamMatchup]
-
-    @classmethod
-    def from_json(cls, data: dict) -> Series:
-        return cls(
-            seriesNumber=data.get("seriesNumber", None),
-            seriesCode=data["seriesCode"],
-            names=SeriesNames.from_json(data["names"]),
-            currentGame=CurrentGame.from_json(data["currentGame"]),
-            conference=Conference.from_json(data["conference"]),
-            round=SeriesRound(**data["round"]),
-            matchupTeams=[TeamMatchup.from_json(x) for x in data.get("matchupTeams", [])],
-        )
-
-
-@dataclass
-class Round:
-    number: int
-    code: int
-    names: RoundNames
-    format: Format
-    series: List[Series]
-
-    @classmethod
-    def from_json(cls, data: dict) -> Round:
-        return cls(
-            number=data["number"],
-            code=data["code"],
-            names=RoundNames(**data["names"]),
-            format=Format(**data["format"]),
-            series=[Series.from_json(x) for x in data["series"]],
-        )
-
-
 @dataclass
 class Playoffs:
-    id: int
-    name: str
-    season: str
-    defaultRound: int
-    rounds: List[Round]
+    year: int
+    bracketLogo: Optional[str] = None
+    bracketLogoFr: Optional[str] = None
+    series: List[PlayoffSeries] = field(default_factory=list)
+
+    @property
+    def logo(self) -> Optional[URL]:
+        if self.bracketLogo:
+            return URL(self.bracketLogo)
 
     @classmethod
-    def from_json(cls, data: dict) -> Playoffs:
-        return cls(**data)
+    def from_json(cls, data: dict, year: int) -> Playoffs:
+        series = [PlayoffSeries.from_json(i, year) for i in data.pop("series", [])]
+        return cls(**data, series=series, year=year)
 
-    @classmethod
-    async def get_playoffs(
-        cls, season: Optional[str] = None, session: Optional[aiohttp.ClientSession] = None
-    ):
-        url = BASE_URL + "/api/v1/tournaments/playoffs?expand=round.series"
-        if season is not None:
-            url += f"&season={season}"
-        if session is None:
-            async with aiohttp.ClientSession() as new_session:
-                async with new_session.get(url) as resp:
-                    data = await resp.json()
-        else:
-            async with session.get(url) as resp:
-                data = await resp.json()
-        return cls(
-            id=data["id"],
-            name=data["name"],
-            season=data["season"],
-            defaultRound=data.get("defaultRound", None),
-            rounds=[Round.from_json(x) for x in data.get("rounds", [])],
-        )
+    def get_series(self, team_1: Team, team_2: Team) -> Optional[PlayoffSeries]:
+        for series in self.series:
+            top_team = series.topSeedTeam
+            bot_team = series.bottomSeedTeam
+            if top_team is None or bot_team is None:
+                continue
+            if top_team.id == team_1.id and bot_team.id == team_2.id:
+                return series
+            if top_team.id == team_2.id and bot_team.id == team_1.id:
+                return series
 
     def embed(self) -> discord.Embed:
         msg = ""
-        if not self.rounds:
+        if not self.series:
             msg = "TBD"
-        season = f"{self.season[:4]}-{self.season[4:]}"
-        embed = discord.Embed(title=_("Playoffs {season}").format(season=season))
-        for rounds in self.rounds:
-            # msg += f"{rounds.names.name}:\n"
-            msg = ""
-            for series in rounds.series:
-                if not series.names.matchupShortName:
-                    msg += "TBD\n"
-                    continue
-                msg += f"{series.names.matchupShortName} - {series.currentGame.seriesSummary.seriesStatus}\n"
-
-            embed.add_field(
-                name=f"{rounds.names.name} - {rounds.format.description}", value=msg, inline=False
-            )
+        embed = discord.Embed(title=_("Stanley Cup Playoffs {season}").format(season=self.year))
+        embed.set_image(url=self.bracketLogo)
+        for series in self.series:
+            top_wins = series.topSeedWins
+            bot_wins = series.bottomSeedWins
+            if series.url:
+                msg = f"[{series.description}]({series.url})\n"
+            else:
+                msg = f"{series.description}\n"
+            msg += f"{top_wins}-{bot_wins}\n"
+            if series.winner is not None:
+                msg += _("Winner: {winner}").format(winner=series.winner)
+            embed.add_field(name=f"{series.seriesTitle}", value=msg)
         return embed
 
 
+@dataclass
+class PlayoffSeries:
+    seriesTitle: str
+    seriesAbbrev: str
+    seriesLetter: str
+    playoffRound: int
+    topSeedRank: int
+    topSeedWins: int
+    bottomSeedRank: int
+    bottomSeedWins: int
+
+    year: int
+
+    winningTeamId: int = -1
+    losingTeamId: int = -1
+    conferenceAbbrev: Optional[str] = None
+    conferenceName: Optional[str] = None
+    seriesLogo: Optional[str] = None
+    seriesLogoFr: Optional[str] = None
+    bottomSeedRankAbbrev: Optional[str] = None
+    topSeedRankAbbrev: Optional[str] = None
+    seriesUrl: Optional[str] = None
+    topSeedTeam: Optional[Team] = None
+    bottomSeedTeam: Optional[Team] = None
+
+    @property
+    def round(self):
+        return self.playoffRound
+
+    @property
+    def title(self) -> str:
+        return _("{year} Stanley Cup Playoffs: {series}").format(
+            year=self.year, series=self.seriesTitle
+        )
+
+    @property
+    def description(self) -> str:
+        return _("{top_team} vs. {bottom_team}").format(
+            top_team=self.topSeedTeam or _("TBD"), bottom_team=self.bottomSeedTeam or _("TBD")
+        )
+
+    @property
+    def url(self) -> Optional[URL]:
+        if self.seriesUrl is not None:
+            return URL("https://nhl.com").join(URL(self.seriesUrl))
+        return None
+
+    @property
+    def logo(self) -> Optional[URL]:
+        if self.seriesLogo is not None:
+            return URL(self.seriesLogo)
+        return None
+
+    @property
+    def logo_fr(self) -> Optional[URL]:
+        if self.seriesLogoFr is not None:
+            return URL(self.seriesLogoFr)
+        return None
+
+    @property
+    def games_played(self) -> int:
+        return self.topSeedWins + self.bottomSeedWins
+
+    @property
+    def winner(self) -> Optional[Team]:
+        if self.winningTeamId <= 0:
+            return None
+        if self.topSeedTeam is None or self.bottomSeedTeam is None:
+            return None
+        elif self.winningTeamId == self.topSeedTeam.id:
+            return self.topSeedTeam
+        else:
+            return self.bottomSeedTeam
+
+    @classmethod
+    def from_json(cls, data: dict, year: int) -> PlayoffSeries:
+        top_team = data.pop("topSeedTeam", None)
+        if top_team:
+            top_team = Team.from_nhle(top_team)
+        bot_team = data.pop("bottomSeedTeam", None)
+        if bot_team:
+            bot_team = Team.from_nhle(bot_team)
+
+        return cls(**data, topSeedTeam=top_team, bottomSeedTeam=bot_team, year=year)
+
+
 class PlayoffsView(discord.ui.View):
-    def __init__(self, start_date: Optional[int]):
+    def __init__(self, start_date: Optional[int], api: NewAPI):
         super().__init__()
         self.playoffs = None
         self.current_page = start_date
@@ -308,6 +245,7 @@ class PlayoffsView(discord.ui.View):
         self.add_item(self.stop_button)
         self.add_item(self.back_button)
         self.add_item(self.forward_button)
+        self.api = api
 
     async def on_timeout(self):
         await self.message.edit(view=None)
@@ -326,8 +264,8 @@ class PlayoffsView(discord.ui.View):
             return {"embed": value, "content": None}
 
     async def show_page(self, page_number: int, interaction: discord.Interaction):
-        season = f"{page_number}{page_number+1}"
-        self.playoffs = await Playoffs.get_playoffs(season)
+        season = page_number
+        self.playoffs = await self.api.get_playoffs(season)
         self.current_page = page_number
         kwargs = await self._get_kwargs_from_page()
         if interaction.response.is_done():
@@ -345,9 +283,9 @@ class PlayoffsView(discord.ui.View):
         if self.playoffs is None:
             season = None
             if self.current_page is not None:
-                season = f"{self.current_page}{self.current_page+1}"
-            self.playoffs = await Playoffs.get_playoffs(season)
-            self.current_page = int(self.playoffs.season[:4])
+                season = self.current_page
+            self.playoffs = await self.api.get_playoffs(season)
+            self.current_page = self.playoffs.year
         kwargs = await self._get_kwargs_from_page()
         return await ctx.send(**kwargs, view=self)
 
@@ -423,11 +361,17 @@ class TeamRecord:
 
     @property
     def gaa(self):
-        return self.goals_against / self.games_played
+        try:
+            return self.goals_against / self.games_played
+        except ZeroDivisionError:
+            return 0.0
 
     @property
     def gpg(self):
-        return self.goals_scored / self.games_played
+        try:
+            return self.goals_scored / self.games_played
+        except ZeroDivisionError:
+            return 0.0
 
     @classmethod
     def from_json(cls, data: dict, division: Division, conference: Conference) -> TeamRecord:
@@ -465,6 +409,60 @@ class TeamRecord:
             last_updated=datetime.strptime(data["lastUpdated"], "%Y-%m-%dT%H:%M:%SZ"),
         )
 
+    @classmethod
+    def from_nhle(cls, data: dict) -> TeamRecord:
+        team_name = data["teamName"].get("default")
+        team = Team.from_name(team_name)
+        division = Division(
+            id=0,
+            name=data["divisionName"],
+            nameShort="",
+            abbreviation=data["divisionAbbrev"],
+            link=None,
+        )
+        conference = Conference(id=0, name=data["conferenceName"], link=None)
+        league_record = LeagueRecord(
+            wins=data["wins"], losses=data["losses"], ot=data["otLosses"], type="league"
+        )
+        streak = Streak(
+            **{
+                "streakType": "wins",
+                "streakNumber": data.get("streakCount", 0),
+                "streakCode": data.get("streakCode", "N/A"),
+            }
+        )
+        return cls(
+            team=team,
+            division=division,
+            conference=conference,
+            league_record=league_record,
+            regulation_wins=int(data["regulationWins"]),
+            goals_against=int(data["goalAgainst"]),
+            goals_scored=int(data["goalFor"]),
+            points=int(data["points"]),
+            division_rank=int(data["divisionSequence"]),
+            division_l10_rank=int(data["divisionL10Sequence"]),
+            division_road_rank=int(data["divisionRoadSequence"]),
+            division_home_rank=int(data["divisionHomeSequence"]),
+            conference_rank=int(data["conferenceSequence"]),
+            conference_l10_rank=int(data["conferenceL10Sequence"]),
+            conference_road_rank=int(data["conferenceRoadSequence"]),
+            conference_home_rank=int(data["conferenceHomeSequence"]),
+            league_rank=int(data["leagueSequence"]),
+            league_l10_rank=int(data["leagueL10Sequence"]),
+            league_road_rank=int(data["leagueRoadSequence"]),
+            league_home_rank=int(data["leagueHomeSequence"]),
+            wildcard_rank=int(data["wildcardSequence"]),
+            row=0,
+            games_played=int(data["gamesPlayed"]),
+            streak=streak,
+            points_percentage=float(data.get("pointPctg", 0.0)),
+            pp_division_rank=0,
+            pp_conference_rank=0,
+            pp_league_rank=0,
+            last_updated=datetime.now(timezone.utc),
+        )
+
 
 class Standings:
     def __init__(self, records: dict = {}):
@@ -489,6 +487,14 @@ class Standings:
             if record.last_updated > latest:
                 latest = record.last_updated
         return latest or datetime.now(timezone.utc)
+
+    @classmethod
+    def from_nhle(cls, data: dict) -> Standings:
+        all_records = {}
+        for team in data["standings"]:
+            record = TeamRecord.from_nhle(team)
+            all_records[record.team.name] = record
+        return cls(records=all_records)
 
     @classmethod
     async def get_team_standings(
@@ -524,8 +530,9 @@ class Standings:
         run when new games for the day is updated
         """
         log.debug("Updating Standings.")
-        config = bot.get_cog("Hockey").config
-        standings = await Standings.get_team_standings()
+        cog = bot.get_cog("Hockey")
+        config = cog.config
+        standings = await cog.api.get_standings()
 
         all_guilds = await config.all_guilds()
         async for guild_id, data in AsyncIter(all_guilds.items(), steps=100):
@@ -593,7 +600,7 @@ class Standings:
         latest_timestamp = self.last_timestamp()
         for division in Divisions:
             if table:
-                new_dict[division.name] = f"```\n{self.get_division_table(division)}\n```"
+                new_dict[division.name] = box(self.get_division_table(division), lang="ansi")
             else:
                 new_dict[division.name] = self.get_division_str(division)
         for div in new_dict:
@@ -613,7 +620,7 @@ class Standings:
         msg = ""
         nhl_icon = "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
         if table:
-            msg = f"```\n{self.get_all_table()}\n```"
+            msg = box(self.get_all_table())
         else:
             msg = self.get_all_str()
         em.description = msg
@@ -659,7 +666,8 @@ class Standings:
         return tabulate(
             sorted(post_data, key=lambda x: int(x[0].replace("*", ""))),
             headers=headers,
-            numalign="left",
+            numalign="center",
+            tablefmt="plain",
         )
 
     def get_division_table(self, division: Divisions) -> str:
@@ -723,7 +731,7 @@ class Standings:
         # timestamp = datetime.strptime(record[0].last_updated, "%Y-%m-%dT%H:%M:%SZ")
         em.timestamp = self.last_timestamp(division=division)
         if table:
-            msg = f"```\n{self.get_division_table(division)}\n```"
+            msg = box(self.get_division_table(division), lang="ansi")
         else:
             msg = self.get_division_str(division)
         em.description = msg
@@ -750,7 +758,7 @@ class Standings:
         em = discord.Embed()
         em.timestamp = utc_to_local(self.last_timestamp(conference=conference), "UTC")
         if table:
-            msg = f"```\n{self.get_conference_table(conference)}\n```"
+            msg = box(self.get_conference_table(conference), lang="ansi")
         else:
             msg = self.get_conference_str(conference)
         em.description = msg
@@ -819,12 +827,14 @@ class Standings:
         division_table = tabulate(division_data, headers=headers)
         league_table = tabulate(league_data, headers=headers)
         em.colour = int(TEAMS[record.team.name]["home"].replace("#", ""), 16)
-        em.set_thumbnail(url=TEAMS[record.team.name]["logo"])
-        em.add_field(name=record.division.name + " Division", value=f"```\n{division_table}\n```")
+        # em.set_thumbnail(url=TEAMS[record.team.name]["logo"])
         em.add_field(
-            name=record.conference.name + " Conference", value=f"```\n{conference_table}\n```"
+            name=f"{record.division.name} Division", value=box(division_table, lang="ansi")
         )
-        em.add_field(name="League", value=f"```\n{league_table}\n```")
+        em.add_field(
+            name=f"{record.conference.name} Conference", value=box(conference_table, lang="ansi")
+        )
+        em.add_field(name="League", value=box(league_table, lang="ansi"))
         em.add_field(
             name="Wins (Regulation)",
             value=f"{record.league_record.wins} ({record.regulation_wins})",

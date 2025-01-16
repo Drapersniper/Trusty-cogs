@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Coroutine,
     Dict,
+    Iterable,
     List,
     Literal,
     NamedTuple,
@@ -26,14 +29,15 @@ from redbot.core.commands import Context
 from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
+from yarl import URL
 
 from .constants import TEAMS
-from .player import SimplePlayer
 from .teamentry import TeamEntry
 
 if TYPE_CHECKING:
-    from .game import Game
+    from .game import Game, GameState
     from .hockey import Hockey
+    from .player import SearchPlayer
 
 
 _ = Translator("Hockey", __file__)
@@ -50,14 +54,139 @@ YEAR_RE = re.compile(r"((19|20)\d\d)-?\/?((19|20)\d\d)?")
 
 TIMEZONE_RE = re.compile(r"|".join(re.escape(zone) for zone in pytz.common_timezones), flags=re.I)
 
-ACTIVE_TEAM_RE_STR = r"|".join(
-    rf"{team}|{data['tri_code']}|{'|'.join(n for n in data['nickname'])}"
-    for team, data in TEAMS.items()
-    if data["active"]
-)
+
+ACTIVE_TEAM_RE_STR = r""
+for team, data in TEAMS.items():
+    if not data["active"]:
+        continue
+    nicks = "|".join(f"\b{n}\b" for n in data["nickname"])
+    ACTIVE_TEAM_RE_STR += rf"\b{team}\b|\b{data['tri_code']}\b|{nicks}"
+
 ACTIVE_TEAM_RE = re.compile(ACTIVE_TEAM_RE_STR, flags=re.I)
 
 VERSUS_RE = re.compile(r"vs\.?|versus", flags=re.I)
+
+
+@dataclass
+class Team:
+    id: int
+    name: str
+    emoji: Union[discord.PartialEmoji, str]
+    logo: str
+    home_colour: str
+    away_colour: str
+    division: str
+    conference: str
+    tri_code: str
+    nickname: List[str]
+    team_url: str
+    timezone: str
+    active: bool
+    invite: Optional[str] = None
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def colour(self) -> discord.Colour:
+        return discord.Colour.from_str(self.home_colour)
+
+    @property
+    def link(self) -> Optional[URL]:
+        return URL(self.team_url)
+
+    @classmethod
+    def from_json(cls, data: dict, team_name: str) -> Team:
+        return cls(
+            id=data.get("id", 0),
+            name=team_name,
+            emoji=discord.PartialEmoji.from_str(data.get("emoji", "")),
+            logo=data.get(
+                "logo", "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
+            ),
+            home_colour=data.get("home", "#000000"),
+            away_colour=data.get("away", "#ffffff"),
+            division=data.get("division", _("unknown")),
+            conference=data.get("conference", _("unknown")),
+            tri_code=data.get("tri_code", "".join([i[0].upper() for i in team_name.split(" ")])),
+            nickname=data.get("nickname", []),
+            team_url=data.get("team_url", ""),
+            timezone=data.get("timezone", "US/Pacific"),
+            active=data.get("active", False),
+            invite=data.get("invite"),
+        )
+
+    @classmethod
+    def from_id(cls, team_id: int) -> Team:
+        for name, data in TEAMS.items():
+            if team_id == data["id"]:
+                return cls(
+                    id=data.get("id", 0),
+                    name=name,
+                    emoji=discord.PartialEmoji.from_str(data.get("emoji", "")),
+                    logo=data.get(
+                        "logo", "https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png"
+                    ),
+                    home_colour=data.get("home", "#000000"),
+                    away_colour=data.get("away", "#ffffff"),
+                    division=data.get("division", _("unknown")),
+                    conference=data.get("conference", _("unknown")),
+                    tri_code=data.get(
+                        "tri_code", "".join([i[0].upper() for i in name.split(" ")])
+                    ),
+                    nickname=data.get("nickname", []),
+                    team_url=data.get("team_url", ""),
+                    timezone=data.get("timezone", "US/Pacific"),
+                    active=data.get("active", False),
+                    invite=data.get("invite"),
+                )
+        return cls(
+            id=team_id,
+            name=_("Unknown Team"),
+            emoji=discord.PartialEmoji.from_str(""),
+            logo="https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png",
+            home_colour="#000000",
+            away_colour="#ffffff",
+            division=_("unknown"),
+            conference=_("unknown"),
+            tri_code="",
+            nickname=[],
+            team_url="",
+            timezone="US/Pacific",
+            active=False,
+            invite=None,
+        )
+
+    @classmethod
+    def from_name(cls, team_name: str) -> Team:
+        for name, data in TEAMS.items():
+            if team_name == name:
+                return cls.from_id(data["id"])
+        return cls(
+            id=0,
+            name=team_name,
+            emoji=discord.PartialEmoji.from_str(""),
+            logo="https://cdn.bleacherreport.net/images/team_logos/328x328/nhl.png",
+            home_colour="#000000",
+            away_colour="#ffffff",
+            division=_("unknown"),
+            conference=_("unknown"),
+            tri_code="".join([i[0].upper() for i in team_name.split(" ")]),
+            nickname=[],
+            team_url="",
+            timezone="US/Pacific",
+            active=False,
+            invite=None,
+        )
+
+    @classmethod
+    def from_nhle(cls, data: dict, home: bool = False) -> Team:
+        name = data.get("name", {}).get("default") or data.get("placeName", {}).get("default")
+        team_id = data.get("id", -1)
+        team_ids = set(i["id"] for i in TEAMS.values())
+        if team_id in team_ids:
+            return cls.from_id(team_id)
+        return cls.from_name(name)
 
 
 class Broadcast(NamedTuple):
@@ -79,7 +208,7 @@ def get_chn_name(game: Game) -> str:
     """
     timestamp = utc_to_local(game.game_start)
     chn_name = "{}-vs-{}-{}-{}-{}".format(
-        game.home_abr, game.away_abr, timestamp.year, timestamp.month, timestamp.day
+        game.home.tri_code, game.away.tri_code, timestamp.year, timestamp.month, timestamp.day
     )
     return chn_name.lower()
 
@@ -137,8 +266,19 @@ class TeamFinder(discord.app_commands.Transformer):
     async def convert(cls, ctx: Context, argument: str) -> str:
         potential_teams = argument.split()
         result = set()
-        include_all = ctx.command.name in ["setup", "add", "otherdiscords"]
-        include_inactive = ctx.command.name in ["roster"]
+        include_all = ctx.command.qualified_name in [
+            "hockey gdt setup",
+            "hockey gdc setup",
+            "hockey set add",
+            "hockey otherdiscords",
+            "hockey notifications start",
+            "hockey notifications goal",
+            "hockey notifications state",
+            "hockey notifications defaultstart",
+            "hockey notifications defaultstate",
+            "hockey notifications defaultgoal",
+        ]
+        include_inactive = ctx.command.qualified_name in []
         if argument in TEAMS.keys():
             return argument
         for team, data in TEAMS.items():
@@ -190,53 +330,20 @@ class TeamFinder(discord.app_commands.Transformer):
 
 class PlayerFinder(discord.app_commands.Transformer):
     @classmethod
-    async def convert(cls, ctx: Context, argument: str) -> List[SimplePlayer]:
+    async def convert(cls, ctx: Context, argument: str) -> List[SearchPlayer]:
         cog = ctx.bot.get_cog("Hockey")
-        path = cog_data_path(cog) / "players.json"
-        await cls().check_and_download(cog)
-        with path.open(encoding="utf-8", mode="r") as f:
-            players = []
-            async for player in AsyncIter(json.loads(f.read())["data"], steps=100):
-                if argument.lower() in player["fullName"].lower():
-                    player = SimplePlayer(
-                        birth_city=player.pop("birthCity"),
-                        birth_country=player.pop("birthCountry"),
-                        birth_state_province=player.pop("birthStateProvince"),
-                        birth_date=player.pop("birthDate"),
-                        current_team_id=player.pop("currentTeamId"),
-                        full_name=player.pop("fullName"),
-                        home_town=player.pop("homeTown"),
-                        last_nhl_team_id=player.pop("lastNHLTeamId"),
-                        on_roster=player.pop("onRoster"),
-                        sweater_number=player.pop("sweaterNumber"),
-                        id=player.pop("id"),
-                        position=player.pop("position"),
-                        height=player.pop("height"),
-                        weight=player.pop("weight"),
-                        is_rookie=player.pop("isRookie"),
-                        is_retired=player.pop("isRetired"),
-                        is_junior=player.pop("isJunior"),
-                        is_suspended=player.pop("isSuspended"),
-                        deceased=player.pop("deceased"),
-                        date_of_death=player.pop("dateOfDeath"),
-                        nationality=player.pop("nationality"),
-                        long_term_injury=player.pop("longTermInjury"),
-                        shoots_catches=player.pop("shootsCatches"),
-                        ep_player_id=player.pop("epPlayerId"),
-                        dda_id=player.pop("ddaId", None),
-                    )
-                    if player.on_roster == "N":
-                        players.append(player)
-                    else:
-                        players.insert(
-                            0,
-                            player,
-                        )
-        return players
+        players = await cog.api.search_player(argument)
+        ret = []
+        for player in players:
+            if player.name.lower() == argument.lower():
+                ret.insert(0, player)
+            else:
+                ret.append(player)
+        return ret
 
     async def transform(
         self, interaction: discord.Interaction, argument: str
-    ) -> List[SimplePlayer]:
+    ) -> List[SearchPlayer]:
         ctx = await interaction.client.get_context(interaction)
         return await self.convert(ctx, argument)
 
@@ -280,18 +387,10 @@ class PlayerFinder(discord.app_commands.Transformer):
         self, interaction: discord.Interaction, current: str
     ) -> List[discord.app_commands.Choice]:
         cog = interaction.client.get_cog("Hockey")
-        path = cog_data_path(cog) / "players.json"
+        players = await cog.api.search_player(current)
         ret = []
-        await self.check_and_download(cog)
-        with path.open(encoding="utf-8", mode="r") as f:
-            data = json.loads(f.read())["data"]
-            for player in data:
-                if current.lower() in player["fullName"].lower():
-                    ret.append(
-                        discord.app_commands.Choice(
-                            name=player["fullName"], value=player["fullName"]
-                        )
-                    )
+        for player in players:
+            ret.append(discord.app_commands.Choice(name=player.name, value=player.name))
         return ret[:25]
 
 
@@ -534,8 +633,27 @@ class StandingsFinder(discord.app_commands.Transformer):
         return choices
 
 
+def game_states_to_int(states: List[str]) -> List[int]:
+    ret = []
+    options = {
+        "Preview": [1, 2, 3, 4],
+        "Live": [5],
+        "Final": [9, 10, 11],
+        "Goal": [],
+        "Periodrecap": [6, 7, 8],
+    }
+    for state in states:
+        ret += options.get(state, [])
+    return ret
+
+
 async def check_to_post(
-    bot: Red, channel: discord.TextChannel, channel_data: dict, post_state: str, game_state: str
+    bot: Red,
+    channel: Union[discord.TextChannel, discord.Thread],
+    channel_data: dict,
+    post_state: List[str],
+    game_state: GameState,
+    is_goal: bool = False,
 ) -> bool:
     if channel is None:
         return False
@@ -543,36 +661,32 @@ async def check_to_post(
     if channel_teams is None:
         await bot.get_cog("Hockey").config.channel(channel).team.clear()
         return False
+    is_countdown = game_state.value in [2, 3, 4]
+    channel_countdown = channel_data["countdown"]
+    if is_countdown and channel_countdown is False:
+        return False
     should_post = False
-    if game_state in channel_data["game_states"]:
+    state_ints = game_states_to_int(channel_data["game_states"])
+    if game_state.value in state_ints:
+        for team in channel_teams:
+            if team in post_state:
+                should_post = True
+    if is_goal and "Goal" in channel_data["game_states"]:
         for team in channel_teams:
             if team in post_state:
                 should_post = True
     return should_post
 
 
-async def get_team_role(guild: discord.Guild, home_team: str, away_team: str) -> Tuple[str, str]:
+def get_team_role(guild: discord.Guild, team_name: str) -> Optional[discord.Role]:
     """
     This returns the role mentions if they exist
     Otherwise it returns the name of the team as a str
     """
-    home_role = None
-    away_role = None
-
-    for role in guild.roles:
-        if "Montréal Canadiens" in home_team and "Montreal Canadiens" in role.name:
-            home_role = role.mention
-        elif role.name == home_team:
-            home_role = role.mention
-        if "Montréal Canadiens" in away_team and "Montreal Canadiens" in role.name:
-            away_role = role.mention
-        elif role.name == away_team:
-            away_role = role.mention
-    if home_role is None:
-        home_role = home_team
-    if away_role is None:
-        away_role = away_team
-    return home_role, away_role
+    role = discord.utils.get(guild.roles, name=team_name)
+    if role is None and "Canadiens" in team:
+        role = discord.utils.get(guild.roles, neam="Montreal Canadiens")
+    return role
 
 
 async def get_team(bot: Red, team: str, game_start: str, game_id: int = 0) -> dict:
@@ -580,7 +694,16 @@ async def get_team(bot: Red, team: str, game_start: str, game_id: int = 0) -> di
     team_list = await config.teams()
     if team_list is None:
         team_list = []
-        team_entry = TeamEntry("Null", team, 0, [], {}, [], "", game_id)
+        team_entry = TeamEntry(
+            game_state=0,
+            team_name=team,
+            period=0,
+            channel=[],
+            goal_id={},
+            created_channel=[],
+            game_start=game_start,
+            game_id=game_id,
+        )
         team_list.append(team_entry.to_json())
         await config.teams.set(team_list)
     for teams in team_list:
@@ -591,7 +714,16 @@ async def get_team(bot: Red, team: str, game_start: str, game_id: int = 0) -> di
         ):
             return teams
     # Add unknown teams to the config to track stats
-    return_team = TeamEntry("Null", team, 0, [], {}, [], "", game_id)
+    return_team = TeamEntry(
+        game_state=0,
+        team_name=team,
+        period=0,
+        channel=[],
+        goal_id={},
+        created_channel=[],
+        game_start=game_start,
+        game_id=game_id,
+    )
     team_list.append(return_team.to_json())
     await config.teams.set(team_list)
     return return_team.to_json()
@@ -612,7 +744,7 @@ async def get_channel_obj(
         if not channel:
             # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
             # log.info(f"{channel_id} channel was removed because it no longer exists")
-            log.info("%s Could not be found", channel_id)
+            log.info("channel ID %s Could not be found", channel_id)
             return None
         guild = channel.guild
         await bot.get_cog("Hockey").config.channel(channel).guild_id.set(guild.id)
@@ -621,13 +753,18 @@ async def get_channel_obj(
     if not guild:
         # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
         # log.info(f"{channel_id} channel was removed because it no longer exists")
-        log.info("%s Could not be found", channel_id)
+        log.info("guild ID %s Could not be found", channel_id)
         return None
     channel = guild.get_channel(channel_id)
     thread = guild.get_thread(channel_id)
     if channel is None and thread is None:
         # await bot.get_cog("Hockey").config.channel_from_id(channel_id).clear()
         # log.info(f"{channel_id} channel was removed because it no longer exists")
-        log.info("%s Could not be found", channel_id)
+        log.info("thread or channel ID %s Could not be found", channel_id)
         return None
     return channel or thread
+
+
+async def slow_send_task(tasks: Iterable[Coroutine]):
+    async for task in AsyncIter(tasks, steps=5, delay=5):
+        await task

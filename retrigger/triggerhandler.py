@@ -7,7 +7,7 @@ import string
 from copy import copy
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, Dict, List, Literal, Optional, Pattern, Tuple, cast
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
 import aiohttp
 import discord
@@ -46,13 +46,13 @@ except ImportError:
 log = getLogger("red.trusty-cogs.ReTrigger")
 _ = Translator("ReTrigger", __file__)
 
-RE_CTX: Pattern = re.compile(r"{([^}]+)\}")
-RE_POS: Pattern = re.compile(r"{((\d+)[^.}]*(\.[^:}]+)?[^}]*)\}")
-LINK_REGEX: Pattern = re.compile(
-    r"(http[s]?:\/\/[^\"\']*\.(?:png|jpg|jpeg|gif|mp3|mp4))", flags=re.I
+RE_CTX: re.Pattern = re.compile(r"{([^}]+)\}")
+RE_POS: re.Pattern = re.compile(r"{((\d+)[^.}]*(\.[^:}]+)?[^}]*)\}")
+LINK_REGEX: re.Pattern = re.compile(
+    r"(http[s]?:\/\/[^\"\']*\.(?:png|jpg|jpeg|gif|mp3|mp4|webp)).*", flags=re.I
 )
-IMAGE_REGEX: Pattern = re.compile(
-    r"(?:(?:https?):\/\/)?[\w\/\-?=%.]+\.(?:png|jpg|jpeg)+", flags=re.I
+IMAGE_REGEX: re.Pattern = re.compile(
+    r"(?:(?:https?):\/\/)?[\w\/\-?=%.]+\.(?:png|jpg|jpeg|webp)+", flags=re.I
 )
 
 
@@ -78,6 +78,19 @@ class TriggerHandler(ReTriggerMixin):
             return True
         return False
 
+    async def can_enable_or_disable(self, author: discord.Member, trigger: Trigger) -> bool:
+        if TriggerResponse.mock in trigger.response_type:
+            # explicitly disallow anyone but the trigger author to
+            # enable or disable mocked command triggers
+            return await self.can_edit(author, trigger)
+        if await self.can_edit(author, trigger):
+            # Allow all who previously could edit to also still do this
+            return True
+        # finally if they could not previously edit compare permissions
+        # to see if they have all required permissions from the triggers
+        # response types
+        return author.guild_permissions >= trigger.get_permissions()
+
     async def is_mod_or_admin(self, member: discord.Member) -> bool:
         guild = member.guild
         if member == guild.owner:
@@ -95,6 +108,17 @@ class TriggerHandler(ReTriggerMixin):
             log.info("Creating guild folder")
             directory.mkdir(exist_ok=True, parents=True)
 
+    async def save_attachment_location(
+        self, attachment: discord.Attachment, guild: discord.Guild
+    ) -> Optional[str]:
+        seed = "".join(random.sample(string.ascii_uppercase + string.digits, k=5))
+        filename = "{}-{}".format(seed, attachment.filename)
+        directory = cog_data_path(self).joinpath(str(guild.id))
+        file_path = cog_data_path(self).joinpath(str(guild.id), str(filename))
+        await self.make_guild_folder(directory)
+        await attachment.save(file_path)
+        return filename
+
     async def save_image_location(self, image_url: str, guild: discord.Guild) -> Optional[str]:
         good_image_url = LINK_REGEX.search(image_url)
         if not good_image_url:
@@ -102,11 +126,11 @@ class TriggerHandler(ReTriggerMixin):
         seed = "".join(random.sample(string.ascii_uppercase + string.digits, k=5))
         filename = good_image_url.group(1).split("/")[-1]
         filename = "{}-{}".format(seed, filename)
-        directory = cog_data_path(self) / str(guild.id)
-        file_path = str(cog_data_path(self)) + f"/{guild.id}/{filename}"
+        directory = cog_data_path(self).joinpath(str(guild.id))
+        file_path = cog_data_path(self).joinpath(str(guild.id), str(filename))
         await self.make_guild_folder(directory)
         async with aiohttp.ClientSession() as session:
-            async with session.get(good_image_url.group(1)) as resp:
+            async with session.get(good_image_url.group(0)) as resp:
                 test = await resp.read()
                 with open(file_path, "wb") as f:
                     f.write(test)
@@ -189,7 +213,7 @@ class TriggerHandler(ReTriggerMixin):
         with Image.open(image) as im:
             if size <= 0:
                 size = 1
-            im.thumbnail((length * size, width * size), Image.ANTIALIAS)
+            im.thumbnail((length * size, width * size), Image.Resampling.LANCZOS)
             byte_array = BytesIO()
             im.save(byte_array, format="PNG")
             byte_array.seek(0)
@@ -203,7 +227,7 @@ class TriggerHandler(ReTriggerMixin):
             length, width = (16 * size, 16 * size)
             start_list = [frame.copy() for frame in ImageSequence.Iterator(im)]
             for frame in start_list:
-                frame.thumbnail((length, width), Image.ANTIALIAS)
+                frame.thumbnail((length, width), Image.Resampling.LANCZOS)
                 img_list.append(frame)
         byte_array = BytesIO()
         img_list[0].save(
@@ -244,7 +268,9 @@ class TriggerHandler(ReTriggerMixin):
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
         if "content" not in payload.data and "embeds" not in payload.data:
+            # ignore edits that don't actually change the content or embeds
             return
+
         if "guild_id" not in payload.data:
             return
         guild = self.bot.get_guild(int(payload.data["guild_id"]))
@@ -257,24 +283,111 @@ class TriggerHandler(ReTriggerMixin):
         if not any(t.check_edits for t in self.triggers[guild.id].values()):
             # log.debug(f"No triggers in {guild=} have check_edits enabled")
             return
-        if "bot" in payload.data.get("author", []):
+        if "bot" in payload.data.get("author", {}):
             return
         channel = guild.get_channel(int(payload.data["channel_id"]))
-        try:
-            message = await channel.fetch_message(int(payload.data["id"]))
-        except (discord.errors.Forbidden, discord.errors.NotFound):
-            log.debug(
-                "I don't have permission to read channel history or cannot find the message."
-            )
+        if payload.cached_message is not None:
+            message = payload.cached_message
+        if "edited_timestamp" not in payload.data:
+            log.debug("Ignoring message edit event due to missing edited_timestamp")
+            # so far as I can tell this happens if the bot suppresses embeds on a users message
+            # The payload only contains the bare minimum data and this is missing causing the later
+            # unapproved method of getting a message object from working properly.
             return
-        except Exception:
-            log.info("Could not find channel or message")
-            # If we can't find the channel ignore it
-            return
+        else:
+            try:
+                message = discord.Message(state=channel._state, channel=channel, data=payload.data)
+            except Exception:
+                log.debug("Error creating new message object from edit information.")
+                return
         if message.author.bot:
             # somehow we got a bot through the previous check :thonk:
             return
         await self.check_triggers(message, True)
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread):
+        if await self.bot.cog_disabled_in_guild(self, thread.guild):
+            return
+        if thread.guild.id not in self.triggers:
+            return
+        if not thread.permissions_for(thread.guild.me).manage_threads:
+            return
+        try:
+            await self.check_triggers_thread(thread)
+        except Exception:
+            log.exception("Error checking thread title")
+
+    @commands.Cog.listener()
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
+        if await self.bot.cog_disabled_in_guild(self, before.guild):
+            return
+        if before.guild.id not in self.triggers:
+            return
+        if not before.permissions_for(before.guild.me).manage_threads:
+            return
+        if before.name != after.name:
+            try:
+                await self.check_triggers_thread(after, edit=True)
+            except Exception:
+                log.exception("Error checking thread title change")
+
+    async def check_triggers_thread(self, thread: discord.Thread, *, edit: bool = False):
+        guild = thread.guild
+        for trigger in self.triggers[guild.id].values():
+            if not trigger.enabled:
+                continue
+            if TriggerResponse.delete not in trigger.response_type:
+                continue
+            if not trigger.read_thread_title:
+                continue
+            if edit and not trigger.check_edits:
+                continue
+            allowed_trigger = await trigger.check_bw_list(author=thread.owner, channel=thread)
+            is_auto_mod = any(r.is_automod for r in trigger.response_type)
+            is_mod = False
+            if thread.owner is not None:
+                is_mod = await self.is_mod_or_admin(thread.owner)
+            if not allowed_trigger:
+                log.debug(
+                    "ReTrigger: %r is immune from allowlist/blocklist %r", thread.owner, trigger
+                )
+                continue
+            if allowed_trigger and (is_auto_mod and is_mod):
+                log.debug(
+                    "ReTrigger: %r is immune from automated actions %r", thread.owner, trigger
+                )
+                continue
+
+            search = await self.safe_regex_search(guild, trigger, thread.name)
+            if not search[0]:
+                trigger.enabled = False
+                return
+            elif search[0] and search[1] != []:
+                trigger.count += 1
+                log.debug(
+                    "ReTrigger: thread from %r triggered for deletion with %r",
+                    thread.owner,
+                    trigger,
+                )
+                try:
+                    log.debug("Deleting thread %r", thread)
+                    await thread.delete()
+                    if await self.config.guild(guild).filter_logs():
+                        await self.modlog_action(thread, trigger, search[1], _("Deleted Thread"))
+                except discord.errors.NotFound:
+                    log.debug(
+                        "Retrigger encountered an error in %r with trigger %r", guild, trigger
+                    )
+                except discord.errors.Forbidden:
+                    log.debug(
+                        "Retrigger encountered an error in %r with trigger %r", guild, trigger
+                    )
+                except Exception:
+                    log.exception(
+                        "Retrigger encountered an error in %r with trigger %r", guild, trigger
+                    )
+                return
 
     async def check_triggers(self, message: discord.Message, edit: bool) -> None:
         """
@@ -290,12 +403,10 @@ class TriggerHandler(ReTriggerMixin):
         author: Optional[discord.Member] = guild.get_member(message.author.id)
         if not author:
             return
-
         blocked = not await self.bot.allowed_by_whitelist_blacklist(author)
         channel_perms = channel.permissions_for(author)
         is_command = await self.check_is_command(message)
         is_mod = await self.is_mod_or_admin(author)
-
         for trigger in self.triggers[guild.id].values():
             if not trigger.enabled:
                 continue
@@ -307,14 +418,19 @@ class TriggerHandler(ReTriggerMixin):
             if trigger.nsfw and not channel.is_nsfw():
                 continue
 
-            allowed_trigger = await trigger.check_bw_list(message)
+            allowed_trigger = await trigger.check_bw_list(author=author, channel=channel)
             is_auto_mod = any(r.is_automod for r in trigger.response_type)
             if not allowed_trigger:
+                log.debug("ReTrigger: %r is immune from allowlist/blocklist %r", author, trigger)
                 continue
             if allowed_trigger and (is_auto_mod and is_mod):
+                log.debug("ReTrigger: %r is immune from automated actions %r", author, trigger)
                 continue
             # log.debug(f"Checking trigger {trigger.name}")
             if is_command and not trigger.ignore_commands:
+                log.debug(
+                    "ReTrigger: %r is ignored because they used a command %r", author, trigger
+                )
                 continue
 
             if any(r.is_automod for r in trigger.response_type):
@@ -361,12 +477,22 @@ class TriggerHandler(ReTriggerMixin):
                     )
                     continue
 
-            content = message.content
+            content = ""
+            content += message.content
             if trigger.read_filenames and message.attachments:
-                content = message.content + " " + " ".join(f.filename for f in message.attachments)
+                content += " " + " ".join(f.filename for f in message.attachments)
 
             if trigger.ocr_search and ALLOW_OCR:
-                content += await self.get_image_text(message)
+                try:
+                    content += await self.get_image_text(message)
+                except Exception:
+                    log.exception(
+                        "Error extracting text from image on trigger: %s, in channel: %s, message: %s",
+                        trigger,
+                        channel.id,
+                        message.id,
+                    )
+                    pass
             if trigger.read_embeds and len(message.embeds) > 0:
                 content += "\n".join(
                     self.convert_embed_to_string(embed, index)
@@ -379,6 +505,7 @@ class TriggerHandler(ReTriggerMixin):
                 )
                 trigger.disable()
                 continue
+            # log.debug("content = %s message.content = %s", content, message.content)
             search = await self.safe_regex_search(guild, trigger, content)
             if not search[0]:
                 trigger.enabled = False
@@ -428,6 +555,8 @@ class TriggerHandler(ReTriggerMixin):
         """
         content = " "
         for attachment in message.attachments:
+            if attachment.content_type and "image" not in attachment.content_type:
+                continue
             temp = BytesIO()
             await attachment.save(temp)
             task = functools.partial(pytesseract.image_to_string, Image.open(temp))
@@ -524,11 +653,23 @@ class TriggerHandler(ReTriggerMixin):
         self, message: discord.Message, trigger: Trigger, find: List[str]
     ) -> None:
         guild: discord.Guild = cast(discord.Guild, message.guild)
-        channel: discord.abc.GuildChannel = message.channel
+        channel = message.channel
         author: discord.Member = cast(discord.Member, message.author)
         reason = _("Trigger response: {trigger}").format(trigger=trigger.name)
         own_permissions = channel.permissions_for(guild.me)
-        if not isinstance(channel, discord.Thread):
+        # is_thread_message = getattr(message, "is_thread", False)
+        if trigger.suppress and own_permissions.manage_messages:
+            try:
+                await message.edit(suppress=True)
+            except Exception:
+                log.exception(
+                    "Error suppressing embeds on a message: %r with trigger %r", message, trigger
+                )
+
+        if isinstance(channel, discord.TextChannel):
+            # currently only text channels are capable of creating threads from
+            # a message being sent. Forum Chanels can't have sent messages by
+            # design and therefore we can't automatically make a thread in them.
             if (
                 trigger.thread.public is not None
                 and own_permissions.send_messages_in_threads
@@ -587,7 +728,9 @@ class TriggerHandler(ReTriggerMixin):
             if guild.me.top_role > author.top_role:
                 if trigger.multi_payload:
                     text_response = "\n".join(
-                        t[1] for t in trigger.multi_payload if t[0] == "rename"
+                        str(t.response)
+                        for t in trigger.multi_payload
+                        if t.action is TriggerResponse.rename
                     )
                 else:
                     text_response = str(trigger.text)
@@ -617,7 +760,11 @@ class TriggerHandler(ReTriggerMixin):
         if TriggerResponse.text in trigger.response_type and own_permissions.send_messages:
             await channel.typing()
             if trigger.multi_payload:
-                text_response = "\n".join(t[1] for t in trigger.multi_payload if t[0] == "text")
+                text_response = "\n".join(
+                    str(t.response)
+                    for t in trigger.multi_payload
+                    if t.action is TriggerResponse.text
+                )
             else:
                 text_response = str(trigger.text)
             response = await self.convert_parms(message, text_response, trigger, find)
@@ -731,7 +878,11 @@ class TriggerHandler(ReTriggerMixin):
 
         if TriggerResponse.dm in trigger.response_type:
             if trigger.multi_payload:
-                dm_response = "\n".join(t[1] for t in trigger.multi_payload if t[0] == "dm")
+                dm_response = "\n".join(
+                    str(t.response)
+                    for t in trigger.multi_payload
+                    if t.action is TriggerResponse.dm
+                )
             else:
                 dm_response = str(trigger.text)
             response = await self.convert_parms(message, dm_response, trigger, find)
@@ -746,7 +897,11 @@ class TriggerHandler(ReTriggerMixin):
 
         if TriggerResponse.dmme in trigger.response_type:
             if trigger.multi_payload:
-                dm_response = "\n".join(t[1] for t in trigger.multi_payload if t[0] == "dmme")
+                dm_response = "\n".join(
+                    str(t.response)
+                    for t in trigger.multi_payload
+                    if t.action is TriggerResponse.dmme
+                )
             else:
                 dm_response = str(trigger.text)
             response = await self.convert_parms(message, dm_response, trigger, find)
@@ -853,7 +1008,11 @@ class TriggerHandler(ReTriggerMixin):
 
         if TriggerResponse.command in trigger.response_type:
             if trigger.multi_payload:
-                command_response = [t[1] for t in trigger.multi_payload if t[0] == "command"]
+                command_response = [
+                    t.response
+                    for t in trigger.multi_payload
+                    if t.action is TriggerResponse.command
+                ]
                 for command in command_response:
                     command = await self.convert_parms(message, command, trigger, find)
                     msg = copy(message)
@@ -870,7 +1029,9 @@ class TriggerHandler(ReTriggerMixin):
                 self.bot.dispatch("message", msg)
         if TriggerResponse.mock in trigger.response_type:
             if trigger.multi_payload:
-                mock_response = [t[1] for t in trigger.multi_payload if t[0] == "mock"]
+                mock_response = [
+                    t.response for t in trigger.multi_payload if t.action is TriggerResponse.mock
+                ]
                 for command in mock_response:
                     command = await self.convert_parms(message, command, trigger, find)
                     msg = copy(message)
@@ -915,30 +1076,31 @@ class TriggerHandler(ReTriggerMixin):
     ) -> str:
         # https://github.com/Cog-Creators/Red-DiscordBot/blob/V3/develop/redbot/cogs/customcom/customcom.py
         # ctx = await self.bot.get_context(message)
-        results = RE_CTX.findall(raw_response)
-        for result in results:
+        ctx_results = RE_CTX.findall(raw_response)
+        content = message.content
+        if trigger.read_filenames and message.attachments:
+            content = message.content + " " + " ".join(f.filename for f in message.attachments)
+        search = trigger.regex.search(content)
+        named_groups = search.groupdict() if search else {}
+        for result in ctx_results:
             param = await self.transform_parameter(result, message)
             raw_response = raw_response.replace("{" + result + "}", param)
-        results = RE_POS.findall(raw_response)
-        if results:
-            for result in results:
-                content = message.content
-                if trigger.read_filenames and message.attachments:
-                    content = (
-                        message.content + " " + " ".join(f.filename for f in message.attachments)
-                    )
-                search = trigger.regex.search(content)
-                if not search:
-                    continue
-                try:
-                    arg = search.group(int(result[0]))
-                    raw_response = raw_response.replace("{" + result[0] + "}", arg)
-                except IndexError:
-                    log.error("Regex pattern is too broad and no matched groups were found.")
-                    continue
-                except Exception:
-                    log.exception("Retrigger encountered an error with trigger %r", trigger)
-                    continue
+            if result in named_groups:
+                raw_response = raw_response.replace("{" + result + "}", named_groups[result])
+
+        num_results = RE_POS.findall(raw_response)
+        for result in num_results:
+            if not search:
+                continue
+            try:
+                arg = search.group(int(result[0]))
+                raw_response = raw_response.replace("{" + result[0] + "}", arg)
+            except IndexError:
+                log.error("Regex pattern is too broad and no matched groups were found.")
+                continue
+            except Exception:
+                log.exception("Retrigger encountered an error with trigger %r", trigger)
+                continue
         raw_response = raw_response.replace("{count}", str(trigger.count))
         if hasattr(message.channel, "guild"):
             prefixes = await self.bot.get_prefix(message.channel)
@@ -980,12 +1142,26 @@ class TriggerHandler(ReTriggerMixin):
         return str(getattr(first, second, raw_result))
 
     async def modlog_action(
-        self, message: discord.Message, trigger: Trigger, find: List[str], action: str
+        self,
+        message_or_thread: Union[discord.Message, discord.Thread],
+        trigger: Trigger,
+        find: List[str],
+        action: str,
     ) -> None:
-        modlogs = await self.config.guild(message.guild).modlog()
-        guild: discord.Guild = cast(discord.Guild, message.guild)
-        author: discord.Member = cast(discord.Member, message.author)
-        channel: discord.TextChannel = cast(discord.TextChannel, message.channel)
+        guild: discord.Guild = cast(discord.Guild, message_or_thread.guild)
+        if isinstance(message_or_thread, discord.Message):
+            author = message_or_thread.author
+            content = message_or_thread.content
+            attachments = message_or_thread.attachments
+            channel: discord.TextChannel = cast(discord.TextChannel, message_or_thread.channel)
+        else:
+            author = message_or_thread.owner
+            content = message_or_thread.name
+            attachments = []
+            channel: discord.TextChannel = cast(discord.TextChannel, message_or_thread.parent)
+
+        modlogs = await self.config.guild(guild).modlog()
+        # author: discord.Member = cast(discord.Member, author)
         if modlogs:
             if modlogs == "default":
                 # We'll get the default modlog channel setup
@@ -1002,7 +1178,7 @@ class TriggerHandler(ReTriggerMixin):
                     return
             infomessage = f"{author} - {action}\n"
             embed = discord.Embed(
-                description=message.content,
+                description=content,
                 colour=discord.Colour.dark_red(),
                 timestamp=datetime.now(tz=timezone.utc),
             )
@@ -1012,11 +1188,11 @@ class TriggerHandler(ReTriggerMixin):
             if found_regex:
                 embed.add_field(name=_("Found Triggers"), value=found_regex[:1024])
             embed.add_field(name=_("Trigger author"), value=f"<@{trigger.author}>")
-            if message.attachments:
-                files = ", ".join(a.filename for a in message.attachments)
+            if attachments:
+                files = ", ".join(a.filename for a in attachments)
                 embed.add_field(name=_("Attachments"), value=files)
-            embed.set_footer(text=_("User ID: ") + str(message.author.id))
-            embed.set_author(name=infomessage, icon_url=author.avatar.url)
+            embed.set_footer(text=_("User ID: ") + str(author.id))
+            embed.set_author(name=infomessage, icon_url=author.display_avatar)
             try:
                 if modlog_channel.permissions_for(guild.me).embed_links:
                     await modlog_channel.send(embed=embed)

@@ -12,6 +12,7 @@ from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import bold, humanize_list
 from redbot.vendored.discord.ext import menus
 
+from .converter import BungieTweet, NewsArticle, NewsArticles
 from .errors import Destiny2APIError
 
 BASE_URL = "https://bungie.net"
@@ -76,7 +77,7 @@ class ClanPendingButton(discord.ui.Button):
         await pred.wait()
         if pred.result:
             try:
-                await self.view.cog.approve_clan_pending(
+                await self.view.cog.api.approve_clan_pending(
                     interaction.user,
                     self.clan_id,
                     self.membership_type,
@@ -172,7 +173,7 @@ class VaultPages(menus.ListPageSource):
     async def format_page(self, menu: menus.MenuPages, page):
         self.current_item_hash = page["itemHash"]
         self.current_item_instance = page.get("itemInstanceId", None)
-        items = await self.cog.get_definition(
+        items = await self.cog.api.get_definition(
             "DestinyInventoryItemDefinition", [self.current_item_hash]
         )
         item_data = items[str(self.current_item_hash)]
@@ -184,11 +185,11 @@ class VaultPages(menus.ListPageSource):
         if item_data.get("screenshot", None):
             embed.set_image(url=BASE_URL + item_data["screenshot"])
         if self.current_item_instance is not None:
-            instance_data = await self.cog.get_instanced_item(
+            instance_data = await self.cog.api.get_instanced_item(
                 menu.author, self.current_item_instance
             )
             perk_hashes = [i["perkHash"] for i in instance_data["perks"]["data"]["perks"]]
-            perk_info = await self.cog.get_definition(
+            perk_info = await self.cog.api.get_definition(
                 "DestinyInventoryItemDefinition", perk_hashes
             )
             perk_str = "\n".join(perk["displayProperties"]["name"] for perk in perk_info.values())
@@ -294,7 +295,7 @@ class DestinyEquipLoadout(discord.ui.Button):
             membership_type = self.view.source.membership_type
             character_id = self.view.source.character
             index = self.view.source.current_index
-            await self.view.cog.equip_loadout(
+            await self.view.cog.api.equip_loadout(
                 interaction.user,
                 index,
                 character_id,
@@ -364,7 +365,7 @@ class PostmasterSelect(discord.ui.Select):
             item_name = item["displayProperties"]["name"]
             url = f"https://www.light.gg/db/items/{item_hash}"
             try:
-                await self.view.cog.pull_from_postmaster(
+                await self.view.cog.api.pull_from_postmaster(
                     interaction.user, item_hash, char_id, membership_type, quantity, instance
                 )
                 self.view.source.remove_item(char_id, item_hash, instance)
@@ -475,34 +476,46 @@ class LoadoutPages(menus.ListPageSource):
 
 
 class BungieNewsSource(menus.ListPageSource):
-    def __init__(self, news_pages: dict):
-        self.pages = news_pages["NewsArticles"]
+    def __init__(self, news_pages: NewsArticles):
+        self.pages = news_pages.NewsArticles
         super().__init__(self.pages, per_page=1)
         self.select_options = []
         for index, page in enumerate(self.pages):
             self.select_options.append(
                 discord.SelectOption(
-                    label=page["Title"][:100], description=page["Description"][:100], value=index
+                    label=page.Title[:100], description=page.Description[:100], value=str(index)
                 )
             )
 
-    async def format_page(self, menu: menus.MenuPages, page: dict):
-        link = page["Link"]
-        time = datetime.strptime(page["PubDate"], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
+    async def format_page(self, menu: Optional[BaseMenu], page: NewsArticle):
+        link = page.Link
+        time = page.pubdate()
         url = f"{BASE_URL}{link}"
         embed = discord.Embed(
-            title=page["Title"],
+            title=page.Title,
             url=url,
-            description=page["Description"],
+            description=page.Description,
             timestamp=time,
         )
-        embed.set_image(url=page["ImagePath"])
+        embed.set_image(url=page.ImagePath)
         # time = datetime.fromisoformat(page["PubDate"])
         # embed.add_field(name=_("Published"), value=discord.utils.format_dt(time, style="R"))
 
         return {"content": url, "embed": embed}
+
+
+class BungieTweetsSource(menus.ListPageSource):
+    def __init__(self, tweets: List[BungieTweet]):
+        self.pages = tweets
+        super().__init__(self.pages, per_page=1)
+        self.select_options = []
+        for index, page in enumerate(self.pages):
+            self.select_options.append(
+                discord.SelectOption(label=page.text[:100], value=str(index))
+            )
+
+    async def format_page(self, menu: Optional[BaseMenu], page: BungieTweet):
+        return {"content": page.url}
 
 
 class BaseMenu(discord.ui.View):

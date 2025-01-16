@@ -1,9 +1,8 @@
 import asyncio
-from typing import Dict, Literal, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple
 
 import discord
 from discord.ext import tasks
-from pytz import NonExistentTimeError
 from red_commons.logging import getLogger
 from redbot import VersionInfo, version_info
 from redbot.core import Config, checks, commands
@@ -11,7 +10,7 @@ from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list, humanize_timedelta, pagify
 from redbot.core.utils.views import SimpleMenu
 
-from .event_obj import ApproveView, ConfirmView, Event, ValidImage
+from .event_obj import ApproveView, ConfirmView, Event, ValidImage, WrongView
 
 log = getLogger("red.trusty-cogs.EventPoster")
 
@@ -28,8 +27,9 @@ EVENT_EMOJIS = [
 class EventPoster(commands.Cog):
     """Create admin approved events/announcements"""
 
-    __version__ = "2.1.0"
+    __version__ = "2.1.4"
     __author__ = "TrustyJAID"
+    __flavor__ = "Admins are sleep deprived :)"
 
     def __init__(self, bot):
         self.bot = bot
@@ -274,14 +274,15 @@ class EventPoster(commands.Cog):
         `[include_maybe=True]` either `true` or `false` to include people who registered as maybe.
         `[message]` Optional message to include with the ping.
         """
-        announcement_channel, approval_channel = await self.get_channels(ctx)
         if str(ctx.author.id) not in await self.config.guild(ctx.guild).events():
             msg = _("You don't have an event running with people to ping.")
             await ctx.send(msg)
             return
         event_data = await self.config.guild(ctx.guild).events()
         event = Event.from_json(self.bot, event_data[str(ctx.author.id)])
-        msg = event.mention(include_maybe) + ":\n" + message
+        msg = event.mention(include_maybe) + ":\n"
+        if message is not None:
+            msg += message
         for page in pagify(msg):
             await ctx.send(page, allowed_mentions=discord.AllowedMentions(users=True))
             # include AllowedMentions here just incase someone has user mentions disabled
@@ -360,16 +361,23 @@ class EventPoster(commands.Cog):
             return await self.post_event(ctx, event)
 
         view = ApproveView(self, ctx)
+        wrongview = WrongView()
 
         em = await event.make_event_embed(ctx)
         msg = _(
             "Please wait for someone to approve your event request. "
             "In the mean time here's how your event will look. "
-            "If this doesn't look right make a new event."
         )
-        await ctx.send(msg, embed=em)
+        wrongview.message = await ctx.send(msg, embed=em, view=wrongview)
         admin_msg = await approval_channel.send(embed=em, view=view)
-        self.waiting_approval[admin_msg.id] = {"event": event, "ctx": ctx}
+        self.waiting_approval[admin_msg.id] = {"event": event, "ctx": ctx, "wrongview": wrongview}
+        await wrongview.wait()
+        if not wrongview.approved:
+            del self.waiting_approval[admin_msg.id]
+            try:
+                await admin_msg.delete()
+            except Exception:
+                pass
 
     async def post_event(self, ctx: commands.Context, event: Event):
         em = await event.make_event_embed(ctx)
@@ -417,7 +425,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have any events running.")
             await ctx.send(msg)
             return
-        elif not clear:
+        if not clear:
             event_data = await self.config.guild(ctx.guild).events()
             event = Event.from_json(self.bot, event_data[str(ctx.author.id)])
             if not event:
@@ -439,9 +447,9 @@ class EventPoster(commands.Cog):
             )
             return
         else:
-            async with self.config.guild(ctx.guild).events() as events:
-                event = Event.from_json(self.bot, events[str(ctx.author.id)])
-                await event.end_event()
+            event_data = await self.config.guild(ctx.guild).events()
+            event = Event.from_json(self.bot, event_data[str(ctx.author.id)])
+            await event.end_event()
             msg = _("Your event has been cleared.")
             await ctx.send(msg)
 
@@ -472,7 +480,7 @@ class EventPoster(commands.Cog):
             return
         em = await event.make_event_embed(ctx)
         msg = _(
-            "{member} is currently hosting. Type `{prefix}clearevent yes` to clear it."
+            "{member} is currently hosting. Type `{prefix}event set remove @hoster` to clear it."
         ).format(member=member.display_name, prefix=ctx.clean_prefix)
         await ctx.send(
             msg,
@@ -568,7 +576,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 event.event = new_description
                 await event.update_event()
@@ -616,7 +624,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 event.max_slots = new_slots
                 await event.update_event()
@@ -637,7 +645,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 seconds = await self.config.guild(ctx.guild).cleanup_seconds()
                 if seconds is None:
@@ -670,7 +678,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 for m in new_members:
                     await self.add_user_to_event(m, event)
@@ -701,7 +709,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 for m in members:
                     if m.id in event.members or m.id in event.maybe:
@@ -731,7 +739,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 for m in new_members:
                     if m.id not in event.members:
@@ -763,7 +771,7 @@ class EventPoster(commands.Cog):
             msg = _("You don't have an event to edit right now.")
             await ctx.send(msg)
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if event.hoster == ctx.author.id:
                 for m in members:
                     if m.id in event.members or m.id in event.maybe:
@@ -954,9 +962,10 @@ class EventPoster(commands.Cog):
             await ctx.send(msg)
             return
         event = None
-        for message_id, events in self.event_cache[ctx.guild.id].items():
-            if event.hoster == hoster.id:
+        for events in self.event_cache[ctx.guild.id].values():
+            if events.hoster == hoster.id:
                 event = events
+                break
         if event is not None:
             await event.end_event()
         await ctx.send(
@@ -989,7 +998,7 @@ class EventPoster(commands.Cog):
             await ctx.send(msg)
         if ctx.guild.id not in self.event_cache:
             return
-        for message_id, event in self.event_cache[ctx.guild.id].items():
+        for event in self.event_cache[ctx.guild.id].values():
             if ctx.author.id in event.members:
                 await event.update_event()
 
@@ -1070,9 +1079,9 @@ class EventPoster(commands.Cog):
             await self.config.guild(ctx.guild).cleanup_seconds.clear()
         await ctx.send(reply)
 
-    @event_settings.command(name="maxevents")
-    @checks.mod_or_permissions(manage_messages=True)
-    @commands.guild_only()
+    # @event_settings.command(name="maxevents")
+    # @checks.mod_or_permissions(manage_messages=True)
+    # @commands.guild_only()
     async def set_max_events(
         self, ctx: commands.Context, number_of_events: Optional[int] = None
     ) -> None:
@@ -1083,10 +1092,10 @@ class EventPoster(commands.Cog):
         at one time.
 
         Note: If this is set then the event author must cancel the event manually
-        by either reacting to the x on the event itself or `[p]clearevent`. This
-        can also be handled automatically with `[p]eventset cleanup` where events
+        by either reacting to the x on the event itself or `[p]event clear yes`. This
+        can also be handled automatically with `[p]event set cleanup` where events
         will last until the designated time after an event has started. Alternatively
-        a mod or admin can cancel an event through `[p]eventset remove`
+        a mod or admin can cancel an event through `[p]event set remove`
         """
 
         if number_of_events is not None and number_of_events <= 0:
@@ -1255,7 +1264,9 @@ class EventPoster(commands.Cog):
             msgs.append(em)
         await SimpleMenu(msgs, use_select_menu=True).start(ctx)
 
-    @event_settings.command(name="ping", aliases=["mention"])
+    @event_settings.command(
+        name="ping", aliases=["mention"], usage="[everyone=False] [here=False] [roles...]"
+    )
     @checks.mod_or_permissions(manage_messages=True)
     @commands.guild_only()
     async def set_ping(
@@ -1263,33 +1274,27 @@ class EventPoster(commands.Cog):
         ctx: commands.Context,
         everyone: Optional[bool] = False,
         here: Optional[bool] = False,
-        role: Optional[discord.Role] = None,
+        roles: commands.Greedy[discord.Role] = (),
     ) -> None:
         """
         Set the ping to use when an event is announced
 
         `[everyone=False]` True or False, whether to include everyone ping.
         `[here=False]` True or False, whether to include here ping.
-        `[role]` Is the role you want to add to the list of pinged roles when
+        `[role...]` Is the role(s) you want to add to the list of pinged roles when
         an event is created.
+
+        If you want to ping here but not everyone you would do something like:
+         - `[p]event set ping false true`
+
+        If you just want to set a few roles you can do:
+         - `[p]event set ping @role1 @role2`
         """
-        current = await self.config.guild(ctx.guild).ping()
-        roles = []
-        for potential_role in current.split(" "):
-            try:
-                existing_role = await commands.RoleConverter().convert(ctx, potential_role)
-                roles.append(existing_role)
-            except Exception:
-                pass
-        if role not in roles:
-            roles.append(role)
-        elif role in roles:
-            roles.remove(role)
-        role_mentions = [r.mention for r in roles]
+        role_mentions = [r.mention for r in roles if r is not None]
         if here:
-            role_mentions.append("@here")
+            role_mentions.insert(0, "@here")
         if everyone:
-            role_mentions.append("@everyone")
+            role_mentions.insert(0, "@everyone")
         pings = humanize_list(role_mentions)
         await self.config.guild(ctx.guild).ping.set(pings)
         reply = _("The following pings have been registered:\n {pings}").format(pings=pings)

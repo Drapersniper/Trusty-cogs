@@ -5,6 +5,7 @@ from typing import Optional
 import discord
 from red_commons.logging import getLogger
 from redbot.core import commands
+from redbot.core.data_manager import cog_data_path
 from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import pagify
@@ -17,14 +18,6 @@ from .helper import get_channel_obj
 from .menu import BaseMenu, SimplePages
 from .pickems import Pickems
 from .standings import Standings
-
-try:
-    from .oilers import Oilers
-
-    LIGHTS_SET = True
-except ImportError:
-    LIGHTS_SET = False
-    pass
 
 _ = Translator("Hockey", __file__)
 
@@ -51,44 +44,50 @@ class HockeyDev(HockeyMixin):
         """
         pass
 
-    @hockeydev.command(name="resetpickemsweekly", with_app_command=False)
-    async def reset_weekly_pickems_data(self, ctx: commands.Context) -> None:
+    @hockeydev.group(name="cleanup")
+    async def cleanup(self, ctx: commands.Context):
         """
-        Force reset all pickems data for the week
+        Cleanup saved channels/guilds that no longer exist.
         """
-        await self.reset_weekly()
-        guilds_to_make_new_pickems = []
-        for guild_id in await self.pickems_config.all_guilds():
-            guild = self.bot.get_guild(guild_id)
-            if guild is None:
-                continue
-            if await self.pickems_config.guild(guild).pickems_channel():
-                guilds_to_make_new_pickems.append(guild)
-        await self.create_weekly_pickems_pages(guilds_to_make_new_pickems)
-        await ctx.send("Finished resetting all pickems data.")
 
-    @hockeydev.command(name="pickemsannounce", with_app_command=False)
-    async def announce_pickems(self, ctx: commands.Context, *, message: str) -> None:
+    @cleanup.command(name="guilds")
+    async def cleanup_guilds(self, ctx: commands.Context):
         """
-        Announce a message in all setup pickems channels
+        Check for missing guilds and clear their data
+        """
+        all_guilds = await self.config.all_guilds()
+        for guild_id in all_guilds:
+            if not self.bot.get_guild(guild_id):
+                await self.config.guild_from_id(guild_id).clear()
+        await ctx.tick(message="Done.")
 
-        This is only useful if there was an error and you want to
-        announce to people that their vote might not have counted.
+    @cleanup.command(name="channels")
+    async def cleanup_channels(self, ctx: commands.Context):
         """
-        all_guilds = await self.pickems_config.all_guilds()
-        for guild_id, data in all_guilds.items():
-            g = self.bot.get_guild(guild_id)
-            if g is None:
-                continue
-            if data["pickems_channels"]:
-                for channel_id in data["pickems_channels"]:
-                    chan = g.get_channel(channel_id)
-                    if chan:
-                        try:
-                            await chan.send(message)
-                        except Exception:
-                            pass
-        await ctx.send(_("Message announced in pickems channels."))
+        Check for missing guilds and clear their data
+        """
+        all_channels = await self.config.all_channels()
+        for channel_id, data in all_channels.items():
+            channel = await get_channel_obj(self.bot, channel_id, data)
+            if channel is None:
+                await self.config.channel_from_id(channel_id).clear()
+        await ctx.tick(message="Done.")
+
+    @hockeydev.command(name="errorchannel")
+    async def set_loop_error_channel(self, ctx: commands.Context, channel: discord.TextChannel):
+        """
+        Specify an error channel for the hockey loop.
+        """
+        if not channel.permissions_for(ctx.me).send_messages:
+            await ctx.send(
+                "I need permission to send messages in {channel}".format(channel=channel.mention)
+            )
+            return
+        await self.config.loop_error_channel.set(channel.id)
+        await self.config.loop_error_guild.set(channel.guild.id)
+        await ctx.send(
+            "I will attempt to send error messages in {channel}.".format(channel=channel.mention)
+        )
 
     @hockeydev.command(with_app_command=False)
     async def getgoals(self, ctx: commands.Context) -> None:
@@ -124,6 +123,57 @@ class HockeyDev(HockeyMixin):
         Dev commands for testing and building pickems
         """
         pass
+
+    @pickems_dev_commands.command(name="backup")
+    async def backup_pickems(self, ctx: commands.Context):
+        """
+        Backup Pickems
+        """
+        data = await self.pickems_config.all_guilds()
+        date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        save = cog_data_path(self).joinpath(f"Pickems-Backup-{date_str}.json")
+        with save.open("w") as outfile:
+            outfile.write(json.dumps(data))
+        await ctx.send(f"I have backed up pickems data to `{save}`.")
+
+    @pickems_dev_commands.command(name="resetweekly", with_app_command=False)
+    async def reset_weekly_pickems_data(self, ctx: commands.Context) -> None:
+        """
+        Force reset all pickems data for the week
+        """
+        await self.reset_weekly()
+        guilds_to_make_new_pickems = []
+        for guild_id in await self.pickems_config.all_guilds():
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            if await self.pickems_config.guild(guild).pickems_channel():
+                guilds_to_make_new_pickems.append(guild)
+        await self.create_weekly_pickems_pages(guilds_to_make_new_pickems)
+        await ctx.send("Finished resetting all pickems data.")
+
+    @pickems_dev_commands.command(name="announce", with_app_command=False)
+    async def announce_pickems(self, ctx: commands.Context, *, message: str) -> None:
+        """
+        Announce a message in all setup pickems channels
+
+        This is only useful if there was an error and you want to
+        announce to people that their vote might not have counted.
+        """
+        all_guilds = await self.pickems_config.all_guilds()
+        for guild_id, data in all_guilds.items():
+            g = self.bot.get_guild(guild_id)
+            if g is None:
+                continue
+            if data["pickems_channels"]:
+                for channel_id in data["pickems_channels"]:
+                    chan = g.get_channel(channel_id)
+                    if chan:
+                        try:
+                            await chan.send(message)
+                        except Exception:
+                            pass
+        await ctx.send(_("Message announced in pickems channels."))
 
     @pickems_dev_commands.command(name="toggle")
     async def pickems_dev_toggle(self, ctx: commands.Context):
@@ -487,16 +537,7 @@ class HockeyDev(HockeyMixin):
         """
         Resets the bots game data incase something goes wrong
         """
-        all_teams = await self.config.teams()
-        for team in await self.config.teams():
-            all_teams.remove(team)
-            team["goal_id"] = {}
-            team["game_state"] = "Null"
-            team["game_start"] = ""
-            team["period"] = 0
-            all_teams.append(team)
-
-        await self.config.teams.set(all_teams)
+        await self.config.teams.clear()
         await ctx.send(_("Saved game data reset."))
 
     @hockeydev.command(with_app_command=False)
@@ -515,7 +556,8 @@ class HockeyDev(HockeyMixin):
         """
         guild = ctx.message.guild
         good_channels = []
-        for channel_id in await self.config.guild(guild).gdc():
+        gdc_chans = await self.config.guild(guild).gdc_chans()
+        for channel_id in gdc_chans.values():
             channel = guild.get_channel(channel_id)
             if channel is None:
                 await self.config.channel_from_id(channel_id).clear()
@@ -569,19 +611,6 @@ class HockeyDev(HockeyMixin):
                     await self.config.guild(guild).gdc.clear()
 
         await ctx.send(_("Saved servers the bot is no longer on have been removed."))
-
-    @hockeydev.command(hidden=True, with_app_command=False)
-    async def lights(self, ctx: commands.Context) -> None:
-        """
-        Tests the philips Hue light integration
-        This is hard coded at the moment with no plans to make work generally
-        this will be safely ignored.
-        """
-        if LIGHTS_SET:
-            hue = Oilers(self.bot)
-            hue.goal_lights()
-            print("done")
-        await ctx.tick()
 
     @hockeydev.command(hidden=True, with_app_command=False)
     async def testloop(self, ctx: commands.Context) -> None:

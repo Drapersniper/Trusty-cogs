@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import List, Literal, Optional
 
 import discord
 from discord import app_commands
 from red_commons.logging import getLogger
-from redbot.core import Config
 from redbot.core.i18n import Translator
 
 from .abc import ReTriggerMixin
+from .converters import MentionStyle
 
 try:
     import regex as re
@@ -53,8 +53,41 @@ class RegexTransformer(app_commands.Transformer):
 
 class TriggerTransformer(app_commands.Transformer):
     async def transform(self, interaction: discord.Interaction, value: str) -> Trigger:
+        cog = interaction.client.get_cog("ReTrigger")
+        triggers = cog.triggers
+        ret = triggers[interaction.guild.id][value]
+        if not await cog.can_edit(interaction.user, ret):
+            await interaction.response.send_message(
+                _("You are not authorized to edit this trigger."), ephemeral=True
+            )
+            return None
+        return ret
+
+    async def autocomplete(self, interaction: discord.Interaction, value: str):
+        guild_id = interaction.guild.id
+        cog = interaction.client.get_cog("ReTrigger")
+        if getattr(interaction.namespace, "guild_id") and await interaction.client.is_owner(
+            interaction.user
+        ):
+            guild_id = int(interaction.namespace.guild_id)
         triggers = interaction.client.get_cog("ReTrigger").triggers
-        return triggers[interaction.guild.id][value]
+        choices = []
+        if guild_id in triggers:
+            for t in triggers[guild_id].values():
+                if not await cog.can_edit(interaction.user, t):
+                    continue
+                choices.append(app_commands.Choice(name=t.name, value=t.name))
+        else:
+            choices = [app_commands.Choice(name="No Triggers set", value="No Triggers set")]
+        return choices[:25]
+
+
+class TriggerStarTransformer(app_commands.Transformer):
+    async def transform(self, interaction: discord.Interaction, value: str) -> List[Trigger]:
+        triggers = interaction.client.get_cog("ReTrigger").triggers
+        if value in triggers[interaction.guild.id]:
+            return [triggers[interaction.guild.id][value]]
+        return [t for t in triggers[interaction.guild.id].values()]
 
     async def autocomplete(self, interaction: discord.Interaction, value: str):
         guild_id = interaction.guild.id
@@ -63,12 +96,16 @@ class TriggerTransformer(app_commands.Transformer):
         ):
             guild_id = int(interaction.namespace.guild_id)
         triggers = interaction.client.get_cog("ReTrigger").triggers
+        include_all = True
+        choices = []
         if guild_id in triggers:
-            choices = [
-                app_commands.Choice(name=t.name, value=t.name)
-                for t in triggers[guild_id].values()
-                if value in t.name
-            ]
+            for t in triggers[guild_id].values():
+                if t.name == "*":
+                    include_all = False
+                choices.append(app_commands.Choice(name=t.name, value=t.name))
+            if include_all:
+                choices.insert(0, app_commands.Choice(name=_("All"), value="*"))
+            choices = [c for c in choices if value.lower() in c.name.lower()]
         else:
             choices = [app_commands.Choice(name="No Triggers set", value="No Triggers set")]
         return choices[:25]
@@ -144,7 +181,7 @@ class ReTriggerSlash(ReTriggerMixin):
     async def whitelist_add_slash(
         self,
         interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
+        trigger: app_commands.Transform[Trigger, TriggerStarTransformer],
         channel: Optional[discord.TextChannel],
         user: Optional[discord.User],
         role: Optional[discord.Role],
@@ -164,7 +201,7 @@ class ReTriggerSlash(ReTriggerMixin):
     async def whitelist_remove_slash(
         self,
         interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
+        trigger: app_commands.Transform[Trigger, TriggerStarTransformer],
         channel: Optional[discord.TextChannel],
         user: Optional[discord.User],
         role: Optional[discord.Role],
@@ -184,7 +221,7 @@ class ReTriggerSlash(ReTriggerMixin):
     async def blacklist_add_slash(
         self,
         interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
+        trigger: app_commands.Transform[Trigger, TriggerStarTransformer],
         channel: Optional[discord.TextChannel],
         user: Optional[discord.User],
         role: Optional[discord.Role],
@@ -204,7 +241,7 @@ class ReTriggerSlash(ReTriggerMixin):
     async def blacklist_remove_slash(
         self,
         interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
+        trigger: app_commands.Transform[Trigger, TriggerStarTransformer],
         channel: Optional[discord.TextChannel],
         user: Optional[discord.User],
         role: Optional[discord.Role],
@@ -228,6 +265,8 @@ class ReTriggerSlash(ReTriggerMixin):
         style: Optional[Literal["guild", "channel", "member"]] = "guild",
     ):
         """Set cooldown options for ReTrigger"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.cooldown(ctx, trigger, time, style)
 
@@ -240,6 +279,8 @@ class ReTriggerSlash(ReTriggerMixin):
         regex: app_commands.Transform[str, RegexTransformer],
     ):
         """Edit the regex of a saved trigger."""
+        if trigger is None:
+            return
         if regex is None:
             return
         ctx = await interaction.client.get_context(interaction)
@@ -252,6 +293,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether to use Optical Character Recognition"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.toggle_ocr_search(ctx, trigger)
 
@@ -263,6 +306,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether a trigger is considered age-restricted."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.toggle_nsfw(ctx, trigger)
 
@@ -274,6 +319,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether to include embed contents in searched text."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.toggle_read_embeds(ctx, trigger)
 
@@ -285,6 +332,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether to search message attachment filenames."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.toggle_filename_search(ctx, trigger)
 
@@ -300,6 +349,8 @@ class ReTriggerSlash(ReTriggerMixin):
         set_to: Optional[bool],
     ):
         """Set whether or not to reply to the triggered message."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.set_reply(ctx, trigger, set_to)
 
@@ -317,6 +368,8 @@ class ReTriggerSlash(ReTriggerMixin):
         thread_name: Optional[str] = None,
     ):
         """Set whether or not to create a thread from the trigger."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.set_create_thread(ctx, trigger, set_to, thread_name=thread_name)
 
@@ -328,44 +381,25 @@ class ReTriggerSlash(ReTriggerMixin):
         set_to: bool,
     ):
         """Set whether or not to send the message with text-to-speech."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.set_tts(ctx, trigger, set_to)
 
-    @edit_slash.command(name="usermention")
+    @edit_slash.command(name="mention")
     @app_commands.checks.has_permissions(manage_messages=True)
-    async def set_user_mention_slash(
+    async def set_mention_slash(
         self,
         interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
-        set_to: bool,
-    ):
-        """Set whether or not this trigger can mention users"""
-        ctx = await interaction.client.get_context(interaction)
-        await self.set_user_menion(ctx, trigger, set_to)
-
-    @edit_slash.command(name="everyonemention")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def set_everyone_mention_slash(
-        self,
-        interaction: discord.Interaction,
-        trigger: app_commands.Transform[Trigger, TriggerTransformer],
-        set_to: bool,
-    ):
-        """Set whether or not this trigger can mention everyone"""
-        ctx = await interaction.client.get_context(interaction)
-        await self.set_everyone_mention(ctx, trigger, set_to)
-
-    @edit_slash.command(name="rolemention")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def set_role_mention_slash(
-        self,
-        interaction: discord.Interaction,
+        style: MentionStyle,
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
         set_to: bool,
     ):
         """Set whether or not this trigger can mention roles"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
-        await self.set_role_mention(ctx, trigger, set_to)
+        await self.set_mention(ctx, style, trigger, set_to)
 
     @edit_slash.command(name="edited")
     @app_commands.checks.has_permissions(manage_messages=True)
@@ -375,6 +409,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether to search message edits."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.toggle_check_edits(ctx, trigger)
 
@@ -386,6 +422,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Toggle whether a trigger will ignore commands."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_ignore_commands(ctx, trigger)
 
@@ -398,6 +436,8 @@ class ReTriggerSlash(ReTriggerMixin):
         text: str,
     ):
         """Edit the text of a saved trigger."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_text(ctx, trigger, text=text)
 
@@ -410,6 +450,8 @@ class ReTriggerSlash(ReTriggerMixin):
         chance: int,
     ):
         """Edit the chance a trigger will execute."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_chance(ctx, trigger, chance)
 
@@ -422,6 +464,8 @@ class ReTriggerSlash(ReTriggerMixin):
         command: str,
     ):
         """Edit the command a trigger runs."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_command(ctx, trigger, command=command)
 
@@ -434,6 +478,8 @@ class ReTriggerSlash(ReTriggerMixin):
         role: discord.Role,
     ):
         """Edit the added or removed role of a saved trigger."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_roles(ctx, trigger, [role])
 
@@ -445,6 +491,8 @@ class ReTriggerSlash(ReTriggerMixin):
         emoji: app_commands.Transform[str, PartialEmojiTransformer],
     ):
         """Edit the emoji reaction of a saved trigger."""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.edit_reactions(ctx, trigger, [emoji])
 
@@ -456,6 +504,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Enable a trigger"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.enable_trigger(ctx, trigger)
 
@@ -467,6 +517,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Disable a trigger"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.disable_trigger(ctx, trigger)
 
@@ -490,6 +542,8 @@ class ReTriggerSlash(ReTriggerMixin):
         trigger: app_commands.Transform[Trigger, TriggerTransformer],
     ):
         """Remove a specified trigger"""
+        if trigger is None:
+            return
         ctx = await interaction.client.get_context(interaction)
         await self.remove(ctx, trigger)
 

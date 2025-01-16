@@ -9,7 +9,7 @@ from redbot.core.i18n import Translator
 
 from .constants import TEAMS
 from .errors import NotAValidTeamError, UserHasVotedError, VotingHasEndedError
-from .game import Game
+from .game import Game, GameState, GameType
 
 _ = Translator("Hockey", __file__)
 log = getLogger("red.trusty-cogs.Hockey")
@@ -103,7 +103,7 @@ class Pickems(discord.ui.View):
     def __init__(
         self,
         game_id: int,
-        game_state: str,
+        game_state: GameState,
         messages: List[str],
         guild: int,
         game_start: datetime,
@@ -113,7 +113,7 @@ class Pickems(discord.ui.View):
         name: str,
         winner: Optional[str],
         link: Optional[str],
-        game_type: str,
+        game_type: GameType,
         should_edit: bool,
     ):
         self.game_id = game_id
@@ -133,7 +133,7 @@ class Pickems(discord.ui.View):
         self.link = link
         self._should_save: bool = True
         # Start true so we save instantiated pickems
-        self.game_type: str = game_type
+        self.game_type: GameType = game_type
         super().__init__(timeout=None)
         disabled_buttons = datetime.now(tz=timezone.utc) > self.game_start
         self.home_button = PickemsButton(
@@ -194,9 +194,9 @@ class Pickems(discord.ui.View):
         time_now = datetime.now(timezone.utc)
 
         team_choice = None
-        if str(team.id) in self.home_emoji:
+        if str(team.id) in str(self.home_emoji):
             team_choice = self.home_team
-        if str(team.id) in self.away_emoji:
+        if str(team.id) in str(self.away_emoji):
             team_choice = self.away_team
         if team_choice is None:
             raise NotAValidTeamError()
@@ -222,7 +222,7 @@ class Pickems(discord.ui.View):
     def to_json(self) -> Dict[str, Any]:
         return {
             "game_id": self.game_id,
-            "game_state": self.game_state,
+            "game_state": self.game_state.value,
             "messages": self.messages,
             "guild": self.guild,
             "game_start": self.game_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -232,7 +232,7 @@ class Pickems(discord.ui.View):
             "name": self.name,
             "winner": self.winner,
             "link": self.link,
-            "game_type": self.game_type,
+            "game_type": self.game_type.value,
             "should_edit": self.should_edit,
         }
 
@@ -241,9 +241,13 @@ class Pickems(discord.ui.View):
         log.trace("Pickems from_json data: %s", data)
         game_start = datetime.strptime(data["game_start"], "%Y-%m-%dT%H:%M:%SZ")
         game_start = game_start.replace(tzinfo=timezone.utc)
+        try:
+            game_state = GameState(data["game_state"])
+        except ValueError:
+            game_state = GameState.from_statsapi(data["game_state"])
         return cls(
             game_id=data["game_id"],
-            game_state=data["game_state"],
+            game_state=game_state,
             messages=data.get("messages", []),
             guild=data["guild"],
             game_start=game_start,
@@ -253,7 +257,7 @@ class Pickems(discord.ui.View):
             name=data.get("name", ""),
             winner=data.get("winner", None),
             link=data.get("link", None),
-            game_type=data.get("game_type", "R"),
+            game_type=GameType(data.get("game_type", "R")),
             should_edit=data.get("should_edit", True),
         )
 
@@ -284,11 +288,8 @@ class Pickems(discord.ui.View):
             return True
         return False
 
-    async def get_game(self) -> Optional[Game]:
-        if self.link is not None:
-            return await Game.from_url(self.link)
-        url = f"https://statsapi.web.nhl.com/api/v1/game/{self.game_id}/feed/live"
-        return await Game.from_url(url)
+    async def get_game(self, api) -> Optional[Game]:
+        return await api.get_game_from_id(self.game_id)
 
     async def check_winner(self, game: Optional[Game] = None) -> bool:
         """
@@ -304,8 +305,8 @@ class Pickems(discord.ui.View):
             return True
         if game is not None:
             return await self.set_pickem_winner(game)
-        if self.link and after_game:
-            log.debug("Checking winner for %r", self)
-            game = await Game.from_url(self.link)
-            return await self.set_pickem_winner(game)
+        # if self.link and after_game:
+        # log.debug("Checking winner for %r", self)
+        # game = await Game.from_url(self.link)
+        # return await self.set_pickem_winner(game)
         return False
