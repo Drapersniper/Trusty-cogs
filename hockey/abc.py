@@ -1,13 +1,14 @@
 import asyncio
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 
+from .api import HockeyAPI
 from .game import Game
 from .helper import (
     DateFinder,
@@ -39,6 +40,7 @@ class HockeyMixin(ABC):
         self.session: aiohttp.ClientSession
         self.pickems_config: Config
         self._ready: asyncio.Event
+        self.api: HockeyAPI
 
     #######################################################################
     # hockey_commands.py                                                  #
@@ -186,6 +188,10 @@ class HockeyMixin(ABC):
 
     @abstractmethod
     async def otherdiscords(self, ctx: commands.Context, team: TeamFinder) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def get_image(self, file_name: str, url: str) -> discord.File:
         raise NotImplementedError()
 
     #######################################################################
@@ -336,56 +342,6 @@ class HockeyMixin(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    async def check_notification_settings(self, guild: discord.Guild) -> str:
-        raise NotImplementedError
-
-    @abstractmethod
-    async def hockey_notifications(self, ctx: commands.Context) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_goal_notification_style(
-        self, ctx: commands.Context, on_off: Optional[bool] = None
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_ot_notification_style(
-        self, ctx: commands.Context, on_off: Optional[bool] = None
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_so_notification_style(
-        self, ctx: commands.Context, on_off: Optional[bool] = None
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_game_start_notification_style(
-        self, ctx: commands.Context, on_off: Optional[bool] = None
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_channel_goal_notification_style(
-        self,
-        ctx: commands.Context,
-        channel: discord.TextChannel,
-        on_off: Optional[bool] = None,
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def set_channel_game_start_notification_style(
-        self,
-        ctx: commands.Context,
-        channel: discord.TextChannel,
-        on_off: Optional[bool] = None,
-    ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
     async def post_standings(
         self,
         ctx: commands.Context,
@@ -412,7 +368,7 @@ class HockeyMixin(ABC):
         self,
         ctx: commands.Context,
         team: TeamFinder,
-        channel: Optional[discord.TextChannel],
+        channel: Optional[discord.TextChannel] = None,
     ) -> None:
         raise NotImplementedError()
 
@@ -422,6 +378,90 @@ class HockeyMixin(ABC):
         ctx: commands.Context,
         team: Optional[TeamFinder] = None,
         channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        raise NotImplementedError()
+
+    #######################################################################
+    # notifications.py                                                    #
+    #######################################################################
+
+    @abstractmethod
+    def get_role_info(self, guild: discord.Guild, data: dict) -> str:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def check_channel_notification_settings(self, channel: discord.TextChannel) -> str:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def check_default_notification_settings(self, guild: discord.Guild) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def hockey_notifications(self, ctx: commands.Context) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def hockey_notification_settings(self, ctx: commands.Context) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_default_game_start_notification_style(
+        self, ctx: commands.Context, team: TeamFinder, *roles: discord.Role
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_default_goal_notification_style(
+        self, ctx: commands.Context, team: TeamFinder, *roles: discord.Role
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_default_state_notification_style(
+        self, ctx: commands.Context, team: TeamFinder, *roles: discord.Role
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_game_start_notification_style(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.Thread],
+        team: TeamFinder,
+        *roles: discord.Role,
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_goal_notification_style(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.Thread],
+        team: TeamFinder,
+        *roles: discord.Role,
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_state_notification_style(
+        self,
+        ctx: commands.Context,
+        channel: Union[discord.TextChannel, discord.Thread],
+        team: TeamFinder,
+        *roles: discord.Role,
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_ot_notification_style(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ) -> None:
+        raise NotImplementedError()
+
+    @abstractmethod
+    async def set_so_notification_style(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
     ) -> None:
         raise NotImplementedError()
 
@@ -691,10 +731,6 @@ class HockeyMixin(ABC):
 
     @abstractmethod
     async def remove_broken_guild(self, ctx: commands.Context) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    async def lights(self, ctx: commands.Context) -> None:
         raise NotImplementedError()
 
     @abstractmethod

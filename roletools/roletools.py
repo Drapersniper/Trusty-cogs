@@ -1,6 +1,6 @@
 import asyncio
 from abc import ABC
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import discord
 from red_commons.logging import getLogger
@@ -17,7 +17,7 @@ from .converter import RawUserIds, RoleHierarchyConverter, SelfRoleConverter
 from .events import RoleToolsEvents
 from .exclusive import RoleToolsExclusive
 from .inclusive import RoleToolsInclusive
-from .menus import BaseMenu, RolePages
+from .menus import BaseMenu, ConfirmView, RolePages
 from .messages import RoleToolsMessages
 from .reactions import RoleToolsReactions
 from .requires import RoleToolsRequires
@@ -85,7 +85,7 @@ class RoleTools(
     """
 
     __author__ = ["TrustyJAID"]
-    __version__ = "1.5.6"
+    __version__ = "1.5.16"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -121,6 +121,8 @@ class RoleTools(
         self.settings: Dict[int, Any] = {}
         self._ready: asyncio.Event = asyncio.Event()
         self.views: Dict[int, Dict[str, discord.ui.View]] = {}
+        self._repo = ""
+        self._commit = ""
 
     def cog_check(self, ctx: commands.Context) -> bool:
         return self._ready.is_set()
@@ -130,7 +132,33 @@ class RoleTools(
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}"
+        ret = f"{pre_processed}\n\n- Cog Version: {self.__version__}\n"
+        # we'll only have a repo if the cog was installed through Downloader at some point
+        if self._repo:
+            ret += f"- Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"- Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
+
+    async def add_cog_to_dev_env(self):
+        await self.bot.wait_until_red_ready()
+        if self.bot.owner_ids and 218773382617890828 in self.bot.owner_ids:
+            try:
+                self.bot.add_dev_env_value("roletools", lambda x: self)
+            except Exception:
+                pass
+
+    async def _get_commit(self):
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "roletools":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
 
     async def load_views(self):
         self.settings = await self.config.all_guilds()
@@ -143,9 +171,13 @@ class RoleTools(
             await self.initialize_buttons()
         except Exception:
             log.exception("Error initializing Buttons")
-        for guild_views in self.views.values():
-            for view in guild_views.values():
-                self.bot.add_view(view)
+        for guild_id, guild_views in self.views.items():
+            for msg_ids, view in guild_views.items():
+                log.trace("Adding view %r to %s", view, guild_id)
+                channel_id, message_id = msg_ids.split("-")
+                self.bot.add_view(view, message_id=int(message_id))
+                # These should be unique messages containing views
+                # and we should track them seperately
         self._ready.set()
 
     async def cog_load(self) -> None:
@@ -186,6 +218,8 @@ class RoleTools(
             await self.config.version.set("1.0.1")
         loop = asyncio.get_running_loop()
         loop.create_task(self.load_views())
+        loop.create_task(self.add_cog_to_dev_env())
+        loop.create_task(self._get_commit())
 
     async def cog_unload(self):
         for views in self.views.values():
@@ -193,68 +227,90 @@ class RoleTools(
                 # Don't forget to remove persistent views when the cog is unloaded.
                 log.verbose("Stopping view %s", view)
                 view.stop()
+        try:
+            self.bot.remove_dev_env_value("roletools")
+        except Exception:
+            pass
 
-    @roletools.group(invoke_without_command=True)
+    async def confirm_selfassignable(
+        self, ctx: commands.Context, roles: List[discord.Role]
+    ) -> None:
+        not_assignable = [r for r in roles if not await self.config.role(r).selfassignable()]
+        if not_assignable:
+            role_list = "\n".join(f"- {role.mention}" for role in not_assignable)
+            msg_str = _(
+                "The following roles are not self assignable:\n{roles}\n"
+                "Would you liked to make them self assignable and self removeable?"
+            ).format(
+                roles=role_list,
+            )
+            pred = ConfirmView(ctx.author)
+            pred.message = await ctx.send(
+                msg_str, view=pred, allowed_mentions=discord.AllowedMentions(roles=False)
+            )
+            await pred.wait()
+            if pred.result:
+                for role in not_assignable:
+                    await self.config.role(role).selfassignable.set(True)
+                    await self.config.role(role).selfremovable.set(True)
+                await ctx.channel.send(
+                    _(
+                        "The following roles have been made self assignable and self removeable:\n{roles}"
+                    ).format(roles=role_list)
+                )
+            else:
+                await ctx.channel.send(
+                    _("Okay I won't make the following rolesself assignable:\n{roles}").format(
+                        roles=role_list
+                    )
+                )
+
+    @roletools.command()
+    @commands.guild_only()
     @commands.bot_has_permissions(manage_roles=True)
-    async def selfrole(self, ctx: Context) -> None:
+    async def selfrole(self, ctx: Context, *, role: SelfRoleConverter) -> None:
         """
         Add or remove a defined selfrole
-        """
-        pass
 
-    @selfrole.command(name="add")
-    async def selfrole_add(self, ctx: Context, *, role: SelfRoleConverter) -> None:
+        `<role>` The role you want to add or remove.
+        If you already have the role it will be removed.
+        """
+        if role not in ctx.author.roles:
+            await self.selfrole_add(ctx, role=role)
+        else:
+            await self.selfrole_remove(ctx, role=role)
+
+    async def selfrole_add(self, ctx: Context, *, role: discord.Role) -> None:
         """
         Give yourself a role
 
         `<role>` The role you want to give yourself
         """
         await ctx.typing()
-        author = ctx.author
+        author: discord.Member = ctx.author
 
         if not await self.config.role(role).selfassignable():
             msg = _("The {role} role is not currently selfassignable.").format(role=role.mention)
             await ctx.send(msg)
             return
-        if required := await self.config.role(role).required():
-            has_required = True
-            for role_id in required:
-                r = ctx.guild.get_role(role_id)
-                if r is None:
-                    async with self.config.role(role).required() as required_roles:
-                        required_roles.remove(role_id)
-                    continue
-                if r not in author.roles:
-                    has_required = False
-            if not has_required:
-                msg = _(
-                    "I cannot grant you the {role} role because you "
-                    "are missing a required role."
-                ).format(role=role.mention)
-                await ctx.send(msg)
-                return
-        if cost := await self.config.role(role).cost():
-            currency_name = await bank.get_currency_name(ctx.guild)
-            if not await bank.can_spend(author, cost):
-                msg = _(
-                    "You do not have enough {currency_name} to acquire "
-                    "this role. You need {cost} {currency_name}."
-                ).format(currency_name=currency_name, cost=cost)
-                await ctx.send(msg)
-                return
-        await self.give_roles(author, [role], _("Selfrole command."))
+        response = await self.give_roles(author, [role], _("Selfrole command."))
+        if response:
+            msg = _("I could not assign that role for the following reasons:\n")
+            for r in response:
+                msg += r.reason
+            await ctx.send(msg)
+            return
         msg = _("You have been given the {role} role.").format(role=role.mention)
         await ctx.send(msg)
 
-    @selfrole.command(name="remove")
-    async def selfrole_remove(self, ctx: Context, *, role: SelfRoleConverter) -> None:
+    async def selfrole_remove(self, ctx: Context, *, role: discord.Role) -> None:
         """
         Remove a role from yourself
 
         `<role>` The role you want to remove.
         """
         await ctx.typing()
-        author = ctx.author
+        author: discord.Member = ctx.author
 
         if not await self.config.role(role).selfremovable():
             msg = _("The {role} role is not currently self removable.").format(role=role.mention)
@@ -273,7 +329,7 @@ class RoleTools(
         self,
         ctx: Context,
         role: RoleHierarchyConverter,
-        *who: Union[discord.Role, discord.TextChannel, discord.Member, str],
+        *who: Union[discord.Role, discord.TextChannel, discord.Thread, discord.Member, str],
     ) -> None:
         """
         Gives a role to designated members.
@@ -307,18 +363,24 @@ class RoleTools(
         async with ctx.typing():
             members = []
             for entity in who:
-                if isinstance(entity, discord.TextChannel) or isinstance(entity, discord.Role):
+                if isinstance(entity, discord.Thread):
+                    try:
+                        thread_members = await entity.fetch_members()
+                        for m in thread_members:
+                            if mem := ctx.guild.get_member(m.id):
+                                members.append(mem)
+                    except Exception:
+                        log.error("Could not find members of thread in %s", entity)
+
+                elif isinstance(entity, discord.TextChannel) or isinstance(entity, discord.Role):
                     members += entity.members
                 elif isinstance(entity, discord.Member):
                     members.append(entity)
                 else:
                     if entity not in ["everyone", "here", "bots", "humans"]:
                         msg = _("`{who}` cannot have roles assigned to them.").format(who=entity)
-                        if is_slash:
-                            await ctx.followup.send(msg)
-                        else:
-                            await ctx.send(msg)
-                            ctx.command.reset_cooldown(ctx)
+                        await ctx.send(msg)
+                        ctx.command.reset_cooldown(ctx)
                         return
                     elif entity == "everyone":
                         members = ctx.guild.members

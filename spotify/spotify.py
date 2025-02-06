@@ -3,11 +3,12 @@ import re
 import time
 from abc import ABC
 from contextlib import asynccontextmanager
-from typing import Literal, Mapping, Optional, Tuple
+from typing import Dict, Literal, Mapping, Optional, Tuple
 
 import discord
 import tekore
 from red_commons.logging import getLogger
+from redbot import VersionInfo, version_info
 from redbot.core import Config, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list
@@ -47,7 +48,7 @@ class Spotify(
     """
 
     __author__ = ["TrustyJAID", "NeuroAssassin"]
-    __version__ = "1.7.0"
+    __version__ = "1.7.3"
 
     def __init__(self, bot):
         super().__init__()
@@ -101,18 +102,50 @@ class Spotify(
         # RPC
         self.dashboard_authed = []
         self.temp_cache = {}
+        self.waiting_auth: Dict[int, asyncio.Event] = {}
         if DASHBOARD:
             self.rpc_extension = DashboardRPC_Spotify(self)
         self.slash_commands = {"guilds": {}}
         self._temp_user_devices = {}
         self.play_ctx = discord.app_commands.ContextMenu(
-            name="Play on Spotify", callback=self.play_from_message
+            name="Play on Spotify",
+            callback=self.play_from_message,
         )
         self.queue_ctx = discord.app_commands.ContextMenu(
-            name="Queue on Spotify", callback=self.play_from_message
+            name="Queue on Spotify",
+            callback=self.play_from_message,
         )
+        self._commit = ""
+        self._repo = ""
 
     async def cog_load(self):
+        if version_info > VersionInfo.from_str("3.5.9"):
+            self.play_ctx.allowed_contexts = discord.app_commands.installs.AppCommandContext(
+                guild=True, dm_channel=True, private_channel=True
+            )
+            self.play_ctx.allowed_installs = discord.app_commands.installs.AppInstallationType(
+                guild=True, user=True
+            )
+            self.queue_ctx.allowed_contexts = discord.app_commands.installs.AppCommandContext(
+                guild=True, dm_channel=True, private_channel=True
+            )
+            self.queue_ctx.allowed_installs = discord.app_commands.installs.AppInstallationType(
+                guild=True, user=True
+            )
+            self.spotify_com.app_command.allowed_contexts = (
+                discord.app_commands.installs.AppCommandContext(
+                    guild=True, dm_channel=True, private_channel=True
+                )
+            )
+            self.spotify_com.app_command.allowed_installs = (
+                discord.app_commands.installs.AppInstallationType(guild=True, user=True)
+            )
+
+        self.bot.tree.add_command(self.play_ctx)
+        self.bot.tree.add_command(self.queue_ctx)
+        await self.set_tokens()
+
+    async def set_tokens(self):
         tokens = await self.bot.get_shared_api_tokens("spotify")
         if not tokens:
             self._ready.set()
@@ -143,10 +176,31 @@ class Spotify(
         Thanks Sinbad!
         """
         pre_processed = super().format_help_for_context(ctx)
-        return f"{pre_processed}\n\nCog Version: {self.__version__}\ntekore Version: {tekore.__version__}"
+        ret = f"{pre_processed}\n\n- Cog Version: {self.__version__}\n"
+        ret += f"- tekore Version: {tekore.__version__}\n"
+        if self._repo:
+            ret += f"- Repo: {self._repo}\n"
+        # we should have a commit if we have the repo but just incase
+        if self._commit:
+            ret += f"- Commit: [{self._commit[:9]}]({self._repo}/tree/{self._commit})"
+        return ret
 
     async def cog_before_invoke(self, ctx: commands.Context) -> None:
+        await self._get_commit()
         await self._ready.wait()
+
+    async def _get_commit(self):
+        if self._repo:
+            return
+        downloader = self.bot.get_cog("Downloader")
+        if not downloader:
+            return
+        cogs = await downloader.installed_cogs()
+        for cog in cogs:
+            if cog.name == "citation":
+                if cog.repo is not None:
+                    self._repo = cog.repo.clean_url
+                self._commit = cog.commit
 
     async def cog_unload(self):
         if DASHBOARD:
@@ -178,6 +232,59 @@ class Spotify(
         cv_token = client._token_cv.set(user_token)
         yield client
         client._token_cv.reset(cv_token)
+
+    @commands.Cog.listener()
+    async def on_oauth_receive(self, user_id: int, payload: dict):
+        if payload["provider"] != "spotify":
+            return
+        if "code" not in payload:
+            log.error("Received Spotify OAuth without a code parameter %s - %s", user_id, payload)
+            return
+        if int(user_id) not in self.waiting_auth:
+            return
+        try:
+            code = payload["code"]
+            state = payload["state"]
+            auth = self.temp_cache[int(user_id)]
+            user_token = await auth.request_token(code=code, state=state)
+            user = self.bot.get_user(int(user_id))
+            if user is None:
+                return
+            await self.save_token(user, user_token)
+            del self.temp_cache[user.id]
+            self.dashboard_authed.append(user.id)
+            msg = _("Detected authentication via dashboard.")
+            await user.send(msg)
+        except KeyError:
+            log.error("Recieved Spotify Auth request but the user was not in the cache.")
+            return
+        except Exception:
+            log.exception("Error setting user OAuth in Spotify")
+        self.waiting_auth[int(user_id)].set()
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        author = message.author
+        if author.id not in self.waiting_auth and author.id not in self.temp_cache:
+            return
+        if self._tokens[-1] not in message.clean_content:
+            return
+        redirected = message.clean_content.strip()
+        auth = self.temp_cache[author.id]
+        try:
+            user_token = await auth.request_token(url=redirected)
+            del self.temp_cache[author.id]
+            msg = _("Detected authentication via message.")
+            await author.send(msg)
+        except AssertionError:
+            msg = _(
+                "You must follow the *latest* link I sent you for authorization. "
+                "Older links are no longer valid."
+            )
+            await author.send(msg)
+            return
+        await self.save_token(author, user_token)
+        self.waiting_auth[author.id].set()
 
     async def get_user_auth(
         self,
@@ -229,6 +336,11 @@ class Spotify(
             await ctx.send(msg, ephemeral=True)
         return None
 
+    async def wait_for_auth(self, user_id: int):
+        if user_id not in self.waiting_auth:
+            raise RuntimeError("Tried to wait for a user's auth but they're not expecting it.")
+        await self.waiting_auth[user_id].wait()
+
     async def ask_for_auth(
         self, ctx: commands.Context, author: discord.User
     ) -> Optional[tekore.Token]:
@@ -239,84 +351,30 @@ class Spotify(
         is_slash = False
         if ctx.interaction:
             is_slash = True
-            msg = _(
-                "Please accept the authorization [here]({auth}) and **DM "
-                "me** with the final full url."
-            ).format(auth=auth.url)
-
-        else:
-            msg = _(
-                "Please accept the authorization in the following link and reply "
-                "to me with the full url\n\n {auth}"
-            ).format(auth=auth.url)
-
-        def check(message):
-            return (author.id in self.dashboard_authed) or (
-                message.author.id == author.id and self._tokens[-1] in message.content
-            )
+        msg = _(
+            "Please accept the authorization [here]({auth}) and **DM "
+            "me** with the final full url."
+        ).format(auth=auth.url)
 
         if is_slash:
             await ctx.send(msg, ephemeral=True)
         else:
             await author.send(msg)
+        self.waiting_auth[author.id] = asyncio.Event()
         try:
-            check_msg = await self.bot.wait_for("message", check=check, timeout=120)
+            await asyncio.wait_for(self.wait_for_auth(author.id), timeout=180)
         except asyncio.TimeoutError:
             # Let's check if they authenticated throug Dashboard
-            if author.id in self.dashboard_authed:
-                msg = _("Detected authentication via dashboard for.")
-                if is_slash:
-                    await ctx.send(msg, ephemeral=True)
-                else:
-                    await author.send(msg)
-                return await self.get_user_auth(ctx, author)
             try:
                 del self.temp_cache[author.id]
+                del self.waiting_auth[author.id]
             except KeyError:
                 pass
             await author.send(_("Alright I won't interact with spotify for you."))
             return
+        return await self.get_user_auth(ctx, author)
 
-        if author.id in self.dashboard_authed:
-            msg = _("Detected authentication via dashboard for {user}.").format(user=author.name)
-            if is_slash:
-                await ctx.send(msg, ephemeral=True)
-            else:
-                await author.send(msg)
-            return await self.get_user_auth(ctx, author)
-
-        redirected = check_msg.clean_content.strip()
-        if self._tokens[-1] not in redirected:
-            del self.temp_cache[author.id]
-            msg = _("Credentials not valid")
-            if is_slash:
-                await ctx.send(msg, ephemeral=True)
-            else:
-                await ctx.send(msg)
-            return
-        reply_msg = _("Your authorization has been set!")
-        if is_slash:
-            await ctx.send(reply_msg, ephemeral=True)
-        else:
-            await author.send(reply_msg)
-        try:
-            user_token = await auth.request_token(url=redirected)
-        except AssertionError:
-            msg = _(
-                "You must follow the *latest* link I sent you for authorization. "
-                "Older links are no longer valid."
-            )
-            if is_slash:
-                await ctx.send(msg, ephemeral=True)
-            else:
-                await author.send(msg)
-            return
-        await self.save_token(author, user_token)
-
-        del self.temp_cache[author.id]
-        return user_token
-
-    async def save_token(self, author: discord.User, user_token: tekore.Token):
+    async def save_token(self, author: discord.abc.User, user_token: tekore.Token):
         async with self.config.user(author).token() as token:
             token["access_token"] = user_token.access_token
             token["refresh_token"] = user_token.refresh_token
@@ -330,7 +388,7 @@ class Spotify(
         self, service_name: str, api_tokens: Mapping[str, str]
     ) -> None:
         if service_name == "spotify":
-            await self.cog_load()
+            await self.set_tokens()
 
     async def play_from_message(self, interaction: discord.Interaction, message: discord.Message):
         queue = interaction.command.name == "Queue on Spotify"
@@ -344,7 +402,9 @@ class Spotify(
         content = message.content + " "
         if message.embeds:
             em_dict = message.embeds[0].to_dict()
-            content += " ".join(v for k, v in em_dict.items() if k in ["title", "description"])
+            content += " ".join(
+                str(v) for k, v in em_dict.items() if k in ["title", "description"]
+            )
             if "title" in em_dict:
                 if "url" in em_dict["title"]:
                     content += " " + em_dict["title"]["url"]
@@ -352,6 +412,21 @@ class Spotify(
                 for field in em_dict["fields"]:
                     content += " " + field["name"] + " " + field["value"]
             log.verbose("Spotify content: %s", content)
+        for component in message.components:
+            if not isinstance(component, discord.ActionRow):
+                if component.custom_id is not None:
+                    continue
+                if component.url is None:
+                    continue
+                content += f" {component.url}"
+            else:
+                for item in component.children:
+                    if item.custom_id is not None:
+                        continue
+                    if item.url is None:
+                        continue
+                    content += f" {item.url}"
+
         content = content.replace("🧑‍🎨", ":artist:")
         # because discord will replace this in URI's automatically 🙄
         song_data = SPOTIFY_RE.finditer(content)
@@ -373,11 +448,15 @@ class Spotify(
 
         user_spotify = tekore.Spotify(sender=self._sender)
         if not any(tracks + albums + playlists):
-            with user_spotify.token_as(user_token):
-                search = await user_spotify.search(
-                    message.content, ("track",), "from_token", limit=50
-                )
-                items = search[0].items
+            try:
+                with user_spotify.token_as(user_token):
+                    search = await user_spotify.search(
+                        message.content, ("track",), "from_token", limit=50
+                    )
+                    items = search[0].items
+            except Exception:
+                await ctx.send(_("No tracks found from that search."))
+                return
             if len(items) > 1:
                 x = SpotifySearchMenu(
                     source=SpotifyTrackPages(items=items, detailed=False),

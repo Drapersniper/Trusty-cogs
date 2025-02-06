@@ -1,6 +1,6 @@
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import Dict, List, Optional, Union
 
 import discord
 import pytz
@@ -12,7 +12,7 @@ from discord.utils import snowflake_time
 from red_commons.logging import getLogger
 from redbot.core import Config, commands
 from redbot.core.bot import Red
-from redbot.core.i18n import Translator, cog_i18n
+from redbot.core.i18n import Translator
 from redbot.core.utils.chat_formatting import humanize_list, humanize_timedelta, pagify
 
 log = getLogger("red.trusty-cogs.EventPoster")
@@ -37,6 +37,27 @@ TIME_RE_STRING = r"|".join(
     ]
 )
 TIME_RE = re.compile(TIME_RE_STRING, re.I)
+
+
+class WrongView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.approved = True
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self):
+        if self.message is not None:
+            await self.message.edit(view=None)
+
+    @discord.ui.button(label=_("This looks wrong"), style=discord.ButtonStyle.red)
+    async def end_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        self.approved = False
+        if self.message is not None:
+            await self.message.edit(view=None)
+        await interaction.response.send_message(
+            _("This event has been cancelled. Feel free to try again.")
+        )
 
 
 class ApproveButton(discord.ui.Button):
@@ -76,6 +97,7 @@ class ApproveView(discord.ui.View):
         await interaction.response.defer()
         event = self.cog.waiting_approval[interaction.message.id]["event"]
         ctx = self.cog.waiting_approval[interaction.message.id]["ctx"]
+        self.cog.waiting_approval[interaction.message.id]["wrongview"].stop()
         event.approver = interaction.user.id
         try:
             await self.cog.post_event(ctx, event)
@@ -551,7 +573,7 @@ class Event(discord.ui.View):
         hoster = ctx.guild.get_member(self.hoster)
         em = discord.Embed()
         em.set_author(
-            name=_("{hoster} is hosting").format(hoster=hoster), icon_url=hoster.avatar.url
+            name=_("{hoster} is hosting").format(hoster=hoster), icon_url=hoster.display_avatar
         )
         try:
             prefixes = await self.bot.get_valid_prefixes(ctx.guild)
@@ -615,7 +637,7 @@ class Event(discord.ui.View):
             approver = ctx.guild.get_member(self.approver)
             em.set_footer(
                 text=_("Approved by {approver}").format(approver=approver),
-                icon_url=approver.avatar.url,
+                icon_url=approver.display_avatar,
             )
         start = await self.start_time()
         if start is not None:

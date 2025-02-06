@@ -27,8 +27,8 @@ from .components import (
 )
 from .errors import NoSchedule
 from .helper import LeaderboardType
-from .player import SimplePlayer
-from .schedule import Schedule, ScheduleList
+from .player import SearchPlayer
+from .schedule import PlayByPlay, PlayByPlayFilter, Schedule, ScheduleList
 
 if TYPE_CHECKING:
     from .abc import HockeyMixin
@@ -63,6 +63,7 @@ class GamesMenu(discord.ui.View):
         self.heatmap_button = HeatmapButton(discord.ButtonStyle.primary, 1)
         self.gameflow_button = GameflowButton(discord.ButtonStyle.primary, 1)
         self.broadcast_button = BroadcastsButton(1)
+
         self.add_item(self.stop_button)
         self.add_item(self.first_item)
         self.add_item(self.back_button)
@@ -80,11 +81,20 @@ class GamesMenu(discord.ui.View):
             self.add_item(self.broadcast_button)
         if isinstance(self.source, ScheduleList):
             self.add_item(self.broadcast_button)
+        if isinstance(self.source, PlayByPlay):
+            self.pbp_filter = PlayByPlayFilter(self.source.select_options)
+            self.add_item(self.pbp_filter)
+            self.heatmap_button.disabled = True
+            self.gameflow_button.disabled = True
+            self.broadcast_button.disabled = True
         self.select_view: Optional[HockeySelectGame] = None
         self.author = None
 
     async def on_timeout(self):
-        await self.message.edit(view=None)
+        try:
+            await self.message.edit(view=None)
+        except Exception:
+            pass
 
     async def start(self, ctx: commands.Context):
         await self.source._prepare_once()
@@ -211,14 +221,17 @@ class LeaderboardPages(menus.ListPageSource):
 
 
 class PlayerPages(menus.ListPageSource):
-    def __init__(self, pages: list, season: str):
+    def __init__(
+        self, pages: list, season: Optional[str] = None, include_headshot: Optional[bool] = True
+    ):
         super().__init__(pages, per_page=1)
         self.pages: List[int] = pages
+        self.season = season
         self.players = {p.id: p for p in pages}
-        self.season: str = season
         self.select_options = []
+        self.include_headshot = include_headshot
         for count, player in enumerate(pages):
-            player_name = player.full_name
+            player_name = player.name
             self.select_options.append(
                 discord.SelectOption(
                     label=player_name[:50],
@@ -228,13 +241,13 @@ class PlayerPages(menus.ListPageSource):
             )
 
     def is_paginating(self) -> bool:
-        return True
+        return len(self.pages) > 1
 
-    async def format_page(self, view: BaseMenu, player: SimplePlayer) -> discord.Embed:
+    async def format_page(self, view: BaseMenu, player: SearchPlayer) -> discord.Embed:
         # player = await Player.from_id(page, session=view.cog.session)
         log.trace("PlayerPages player: %s", player)
-        player = await player.get_full_stats(self.season, session=view.cog.session)
-        em = player.get_embed()
+        player_stats = await view.cog.api.get_player(player.id)
+        em = player_stats.get_embed(self.season, self.include_headshot)
         em.set_footer(text=f"Page {view.current_page + 1}/{self.get_max_pages()}")
         return em
 
@@ -292,7 +305,10 @@ class BaseMenu(discord.ui.View):
         return self._source
 
     async def on_timeout(self):
-        await self.message.edit(view=None)
+        try:
+            await self.message.edit(view=None)
+        except Exception:
+            pass
 
     async def start(
         self, ctx: commands.Context, content: Optional[str] = None, ephemeral: bool = False

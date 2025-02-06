@@ -10,10 +10,10 @@ from redbot.core.i18n import Translator
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import pagify
 
-from hockey.helper import utc_to_local
+from hockey.helper import slow_send_task, utc_to_local
 
 from .abc import HockeyMixin
-from .game import Game
+from .game import Game, GameState, GameType
 from .pickems import Pickems
 
 _ = Translator("Hockey", __file__)
@@ -91,13 +91,22 @@ class HockeyPickems(HockeyMixin):
                         log.trace("Saving pickem %r", pickem)
                         data[name] = pickem.to_json()
                     self.all_pickems[guild_id][name]._should_save = False
-                    if pickem.game_type in ["P", "PR"]:
-                        if (datetime.now(timezone.utc) - pickem.game_start) >= timedelta(days=7):
-                            del data[name]
-                            if guild_id not in to_del:
-                                to_del[guild_id] = [name]
-                            else:
-                                to_del[guild_id].append(name)
+                    days_old = datetime.now(timezone.utc) - pickem.game_start
+                    if pickem.game_type in [
+                        GameType.pre_season,
+                        GameType.playoffs,
+                    ] and days_old >= timedelta(days=7):
+                        del data[name]
+                        if guild_id not in to_del:
+                            to_del[guild_id] = [name]
+                        else:
+                            to_del[guild_id].append(name)
+                    elif days_old >= timedelta(days=30):
+                        del data[name]
+                        if guild_id not in to_del:
+                            to_del[guild_id] = [name]
+                        else:
+                            to_del[guild_id].append(name)
 
         for guild_id, names in to_del.items():
             for name in names:
@@ -118,7 +127,7 @@ class HockeyPickems(HockeyMixin):
     @pickems_loop.before_loop
     async def before_pickems_loop(self) -> None:
         log.trace("Waiting for Red to be ready")
-        await self.bot.wait_until_ready()
+        await self.bot.wait_until_red_ready()
         log.trace("Waiting for the cog to finish migrating")
         await self._ready.wait()
         # wait until migration if necessary
@@ -135,6 +144,8 @@ class HockeyPickems(HockeyMixin):
                 continue
             # pickems = [Pickems.from_json(p) for p in pickems_list]
             pickems = {name: Pickems.from_json(p) for name, p in pickems_list.items()}
+            if not pickems:
+                continue
             self.all_pickems[str(guild_id)] = pickems
             for name, pickem in pickems.items():
                 try:
@@ -143,7 +154,7 @@ class HockeyPickems(HockeyMixin):
                     log.exception("Error adding pickems to the bot %r", pickem)
 
     def pickems_name(self, game: Game) -> str:
-        return f"{game.away_abr}@{game.home_abr}-{game.game_start.month}-{game.game_start.day}"
+        return f"{game.away.tri_code}@{game.home.tri_code}-{game.game_start.month}-{game.game_start.day}"
 
     async def find_pickems_object(self, game: Game) -> List[Pickems]:
         """
@@ -194,6 +205,7 @@ class HockeyPickems(HockeyMixin):
     async def set_guild_pickem_winner(self, game: Game, edit_message: bool = False) -> None:
         all_pickems = self.all_pickems.copy()
         # log.debug("Setting winner for game %r", game)
+        tasks = []
         for guild_id, pickems in all_pickems.items():
             if str(game.game_id) not in pickems:
                 # log.debug("Game %r not in pickems list.", game)
@@ -206,7 +218,7 @@ class HockeyPickems(HockeyMixin):
             if not await pickem.check_winner(game):
                 # log.debug("Game %r does not have a winner yet.", game)
                 continue
-            if game.game_state == pickem.game_state:
+            if game.game_state is pickem.game_state:
                 # log.debug("Game state %s not equal to pickem game state %s", game.game_state, pickem.game_state)
                 continue
             pickem.game_state = game.game_state
@@ -230,9 +242,9 @@ class HockeyPickems(HockeyMixin):
                 if not channel:
                     # log.debug("Game %r missing channel", game)
                     continue
-                asyncio.create_task(
-                    self.edit_pickems_message(channel, int(message_id), game, pickem)
-                )
+                tasks.append(self.edit_pickems_message(channel, int(message_id), game, pickem))
+        if tasks:
+            asyncio.create_task(slow_send_task(tasks))
 
     async def edit_pickems_message(
         self, channel: discord.Thread, message_id: int, game: Game, pickem: Pickems
@@ -293,7 +305,8 @@ class HockeyPickems(HockeyMixin):
             return self.all_pickems[str(guild.id)][str(game.game_id)]
 
     async def fix_pickem_game_start(self, game: Game):
-        async for guild_id, data in AsyncIter(self.all_pickems.items(), steps=100):
+        tasks = []
+        async for guild_id, data in AsyncIter(self.all_pickems.items(), steps=50):
             guild = self.bot.get_guild(int(guild_id))
             if guild is None:
                 continue
@@ -316,7 +329,7 @@ class HockeyPickems(HockeyMixin):
                         if channel is None:
                             # log.debug("Game %r missing channel", game)
                             continue
-                        asyncio.create_task(
+                        tasks.append(
                             self.edit_pickems_message(channel, int(message_id), game, pickem)
                         )
             else:
@@ -337,7 +350,9 @@ class HockeyPickems(HockeyMixin):
                     ):
                         thread = guild.get_thread(int(thread_id))
                 if thread is not None:
-                    await self.create_pickems_game_message(thread, game)
+                    tasks.append(self.create_pickems_game_message(thread, game))
+        if tasks:
+            asyncio.create_task(slow_send_task(tasks))
 
     async def reset_weekly(self) -> None:
         # Reset the weekly leaderboard for all servers
@@ -425,21 +440,32 @@ class HockeyPickems(HockeyMixin):
         # 12 should cover most of the US and most times are in relation to the US
         # In practice we don't care since the exact dates are under the game themselves
         # but this is used to display a mostly accurate day.
-        message = await channel.send(_("Pickems <t:{date}:D>").format(date=timestamp))
+        start_msg = _("Pickems <t:{date}:D>").format(date=timestamp)
         name = _("Pickems-{month}-{day}").format(month=day.month, day=day.day)
         auto_archive_duration = 10080
-
-        try:
-            new_chn = await channel.create_thread(
-                name=name, message=message, auto_archive_duration=auto_archive_duration
-            )
-            for page in pagify(msg):
-                await new_chn.send(page)
-        except discord.Forbidden:
-            # await self.pickems_config.guild(guild).pickems_channel.clear()
-            return None
-        except discord.HTTPException:
-            return None
+        new_chn = None
+        if isinstance(channel, discord.TextChannel):
+            message = await channel.send(start_msg)
+            try:
+                new_chn = await channel.create_thread(
+                    name=name, message=message, auto_archive_duration=auto_archive_duration
+                )
+                for page in pagify(msg):
+                    await new_chn.send(page)
+            except (discord.Forbidden, discord.HTTPException):
+                return None
+        elif isinstance(channel, discord.ForumChannel):
+            start_pages = [p for p in pagify(f"{start_msg}\n{msg}")]
+            content = start_pages.pop(0)
+            try:
+                channel_with_msg = await channel.create_thread(
+                    name=name, content=content, auto_archive_duration=auto_archive_duration
+                )
+                new_chn = channel_with_msg[0]
+                for page in start_pages:
+                    await new_chn.send(page)
+            except (discord.Forbidden, discord.HTTPException):
+                return None
         return new_chn
 
     async def create_pickems_channel(
@@ -486,7 +512,7 @@ class HockeyPickems(HockeyMixin):
 
     async def make_pickems_msg(self, guild: discord.Guild, game: Game) -> str:
         winner = ""
-        if game.game_state == "Final":
+        if game.game_state.value > GameState.over.value:
             team = game.home_team if game.home_score > game.away_score else game.away_team
             team_emoji = game.home_emoji if game.home_score > game.away_score else game.away_emoji
             winner = _("**WINNER:** {team_emoji} {team}").format(team_emoji=team_emoji, team=team)
@@ -541,7 +567,7 @@ class HockeyPickems(HockeyMixin):
             else:
                 save_data[new_channel.guild.id].append(new_channel.id)
 
-        games_list = await Game.get_games(None, day, day, self.session)
+        games_list = await self.api.get_games(None, day, day)
 
         # msg_tasks = []
         for game in games_list:
@@ -711,7 +737,13 @@ class HockeyPickems(HockeyMixin):
         async for name, pickems in AsyncIter(pickems_list.items(), steps=10):
             # check for definitive winner here just incase
             if name not in self.pickems_games:
-                game = await pickems.get_game()
+                try:
+                    game = await pickems.get_game(self.api)
+                except Exception:
+                    log.exception(
+                        "Error getting game info for %s - %s", pickems.name, pickems.game_id
+                    )
+                    continue
                 self.pickems_games[name] = game
                 await self.set_guild_pickem_winner(self.pickems_games[name])
                 # Go through all the current pickems for every server
@@ -748,11 +780,11 @@ class HockeyPickems(HockeyMixin):
                                 await bank.deposit_credits(member, int(base_credits))
                             except Exception:
                                 log.debug("Could not deposit pickems credits for %r", member)
-                        if pickems.game_type == "P":
+                        if pickems.game_type is GameType.playoffs:
                             leaderboard[str(user)]["playoffs"] += 1
                             leaderboard[str(user)]["playoffs_weekly"] += 1
                             leaderboard[str(user)]["playoffs_total"] += 1
-                        elif pickems.game_type == "PR":
+                        elif pickems.game_type is GameType.pre_season:
                             leaderboard[str(user)]["pre-season"] += 1
                             leaderboard[str(user)]["pre-season_weekly"] += 1
                             leaderboard[str(user)]["pre-season_total"] += 1
@@ -763,9 +795,9 @@ class HockeyPickems(HockeyMixin):
                             # playoffs is finished
                             leaderboard[str(user)]["weekly"] += 1
                     else:
-                        if pickems.game_type == "P":
+                        if pickems.game_type is GameType.playoffs:
                             leaderboard[str(user)]["playoffs_total"] += 1
-                        elif pickems.game_type == "PR":
+                        elif pickems.game_type is GameType.pre_season:
                             leaderboard[str(user)]["pre-season_total"] += 1
                         else:
                             leaderboard[str(user)]["total"] += 1
@@ -817,6 +849,9 @@ class HockeyPickems(HockeyMixin):
         """
         Show the servers current pickems settings
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         data = await self.pickems_config.guild(ctx.guild).all()
         category_channel = ctx.guild.get_channel(data.get("pickems_category"))
         category = category_channel.mention if category_channel else None
@@ -866,7 +901,9 @@ class HockeyPickems(HockeyMixin):
         `<amount>` The number of credits that will be awarded to everyone
         who voted correctly on the game.
         """
-
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if amount and amount <= 0:
             amount = None
         global_bank = await bank.is_global()
@@ -906,9 +943,13 @@ class HockeyPickems(HockeyMixin):
         `<amount>` The number of credits that will be awarded to the winners
         every week.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if amount and amount <= 0:
             amount = None
         global_bank = await bank.is_global()
+        author = ctx.author
 
         if global_bank and not await self.bot.is_owner(author):
             msg = _("This command is restricted to bot owner while the bank is global.")
@@ -946,6 +987,9 @@ class HockeyPickems(HockeyMixin):
 
         `<amount>` The number of top members to receive the weekly awarded amount.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if amount and amount <= 0:
             amount = None
         global_bank = await bank.is_global()
@@ -998,6 +1042,9 @@ class HockeyPickems(HockeyMixin):
         users per week to earn the weekly reward.
 
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         global_bank = await bank.is_global()
         currency_name = await bank.get_currency_name(ctx.guild)
         if global_bank:
@@ -1040,7 +1087,7 @@ class HockeyPickems(HockeyMixin):
     async def setup_auto_pickems(
         self,
         ctx: commands.Context,
-        channel: Optional[discord.TextChannel] = None,
+        channel: Union[discord.TextChannel, discord.ForumChannel] = commands.CurrentChannel,
     ) -> None:
         """
         Sets up automatically created pickems threads every week.
@@ -1048,6 +1095,9 @@ class HockeyPickems(HockeyMixin):
         `[channel]` the channel where pickems threads will be created.
         If not provided this will use the current channel.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         await ctx.defer()
         if not await self.check_pickems_req(ctx):
             return
@@ -1055,28 +1105,25 @@ class HockeyPickems(HockeyMixin):
             msg = _("You cannot create threads within threads.")
             await ctx.send(msg)
             return
-        pickems_channel = ctx.channel
-        if channel is not None:
-            pickems_channel = channel
 
-        if not pickems_channel.permissions_for(ctx.guild.me).create_public_threads:
+        if not channel.permissions_for(ctx.guild.me).create_public_threads:
             msg = _("I don't have permission to create public threads!")
             await ctx.send(msg)
             return
-        if not pickems_channel.permissions_for(ctx.guild.me).manage_threads:
+        if not channel.permissions_for(ctx.guild.me).manage_threads:
             msg = _("I do not have permission to manage threads in {channel}.").format(
-                channel=pickems_channel.mention
+                channel=channel.mention
             )
             await ctx.send(msg)
             return
-        if not pickems_channel.permissions_for(ctx.guild.me).send_messages_in_threads:
+        if not channel.permissions_for(ctx.guild.me).send_messages_in_threads:
             msg = _("I do not have permission to send messages in threads in {channel}.").format(
-                channel=pickems_channel.mention
+                channel=channel.mention
             )
             await ctx.send(msg)
             return
 
-        await self.pickems_config.guild(ctx.guild).pickems_channel.set(pickems_channel.id)
+        await self.pickems_config.guild(ctx.guild).pickems_channel.set(channel.id)
         existing_channels = await self.pickems_config.guild(ctx.guild).pickems_channels()
         if existing_channels:
             await self.pickems_config.guild(ctx.guild).pickems_channels.clear()
@@ -1090,6 +1137,9 @@ class HockeyPickems(HockeyMixin):
         """
         Enable pickems buttons to be edited showing the number of votes for each team
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         await self.pickems_config.guild(ctx.guild).show_count.set(enabled)
         if enabled:
             msg = _("Pickems will attempt to edit the buttons showing the number of votes.")
@@ -1103,6 +1153,9 @@ class HockeyPickems(HockeyMixin):
         """
         Stop posting new pickems threads and clear existing list of pickems threads.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         existing_channels = await self.pickems_config.guild(ctx.guild).pickems_channels()
         if existing_channels:
             await self.pickems_config.guild(ctx.guild).pickems_channels.clear()
@@ -1118,21 +1171,25 @@ class HockeyPickems(HockeyMixin):
         `[date]` is a specified day in the format "YYYY-MM-DD"
         if `date` is not provided the current day is used instead.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         await ctx.defer()
         if not await self.check_pickems_req(ctx):
             return
         if date is None:
-            new_date = datetime.now()
+            new_date = datetime.now(timezone.utc)
         else:
             try:
                 new_date = datetime.strptime(date, "%Y-%m-%d")
+                new_date.replace(tzinfo=timezone.utc)
             except ValueError:
                 msg = _("`date` must be in the format `YYYY-MM-DD`.")
                 await ctx.send(msg)
                 return
         guild_message = await self.pickems_config.guild(ctx.guild).pickems_message()
         msg = _(PICKEMS_MESSAGE).format(guild_message=guild_message)
-        games_list = await Game.get_games(None, new_date, new_date, session=self.session)
+        games_list = await self.api.get_games(None, new_date, new_date)
         for page in pagify(msg):
             await ctx.channel.send(page)
         for game in games_list:
@@ -1146,6 +1203,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             await self.pickems_config.guild(ctx.guild).pickems.clear()
             try:
@@ -1171,6 +1231,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             await self.pickems_config.guild(ctx.guild).leaderboard.clear()
             await ctx.send(_("Server leaderboard reset."))
@@ -1185,6 +1248,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             await self.tally_guild_leaderboard(ctx.guild)
             await ctx.send(_("Server leaderboard has been saved."))
@@ -1198,6 +1264,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1215,6 +1284,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1235,6 +1307,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1254,6 +1329,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1274,6 +1352,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1295,6 +1376,9 @@ class HockeyPickems(HockeyMixin):
 
         `<true_or_false>` `True` if you're sure you want to clear the settings.
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         if true_or_false:
             async with self.pickems_config.guild(ctx.guild).leaderboard() as leaderboard:
                 if leaderboard is None:
@@ -1320,6 +1404,9 @@ class HockeyPickems(HockeyMixin):
         """
         Allows moderators to set a users points on the leaderboard
         """
+        if not ctx.guild:
+            await ctx.send(_("This command can only work inside a server."))
+            return
         leaderboard = await self.pickems_config.guild(ctx.guild).leaderboard()
         if leaderboard == {} or leaderboard is None:
             await ctx.send(_("There is no current leaderboard for this server!"))

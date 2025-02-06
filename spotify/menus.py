@@ -453,7 +453,7 @@ class SpotifyPlaylistsPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Spotify Playlists").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for playlist in playlists:
@@ -480,7 +480,7 @@ class SpotifyTopTracksPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Top Tracks").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for track in tracks:
@@ -505,7 +505,7 @@ class SpotifyTopArtistsPages(menus.ListPageSource):
         em = discord.Embed(color=discord.Colour(0x1DB954))
         em.set_author(
             name=_("{user}'s Top Artists").format(user=view.author.display_name),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
         )
         msg = ""
         for artist in artists:
@@ -569,7 +569,7 @@ class SpotifyPages(menus.PageSource):
             album = f"[{album.name}](https://open.spotify.com/album/{album.id})"
         em.set_author(
             name=f"{view.author.display_name}" + _(" is currently listening to"),
-            icon_url=view.author.avatar.url,
+            icon_url=view.author.display_avatar,
             url=url,
         )
         repeat = (
@@ -652,24 +652,28 @@ class SpotifyPages(menus.PageSource):
                     playlist_id = cur_state.context.uri.split(":")[-1]
                     cur_tracks = None
                     tracks = []
-                    if cur_state.context.type == "playlist":
-                        cur_tracks = await user_spotify.playlist(playlist_id)
-                        tracks = [t.track for t in cur_tracks.tracks.items if t.track is not None]
-                    if cur_state.context.type == "album":
-                        cur_tracks = await user_spotify.album(playlist_id)
-                        tracks = [t for t in cur_tracks.tracks.items if t is not None]
-                    if cur_state.context.type == "artist":
-                        cur_tracks = await user_spotify.artist(playlist_id)
-                        top_tracks = await user_spotify.artist_top_tracks(
-                            playlist_id, "from_token"
-                        )
-                        tracks = [t for t in top_tracks if t is not None]
-                    if cur_state.context.type == "collection":
-                        cur_tracks = await user_spotify.saved_tracks(limit=50)
-                        cur_tracks.name = _("Saved Tracks")
-                        tracks = [t.track for t in cur_tracks.items if t is not None]
+                    try:
+                        if cur_state.context.type == "playlist":
+                            cur_tracks = await user_spotify.playlist(playlist_id)
+                            tracks = [
+                                t.track for t in cur_tracks.tracks.items if t.track is not None
+                            ]
+                        if cur_state.context.type == "album":
+                            cur_tracks = await user_spotify.album(playlist_id)
+                            tracks = [t for t in cur_tracks.tracks.items if t is not None]
+                        if cur_state.context.type == "artist":
+                            cur_tracks = await user_spotify.artist(playlist_id)
+                            top_tracks = await user_spotify.artist_top_tracks(
+                                playlist_id, "from_token"
+                            )
+                            tracks = [t for t in top_tracks if t is not None]
+                        if cur_state.context.type == "collection":
+                            cur_tracks = await user_spotify.saved_tracks(limit=50)
+                            tracks = [t.track for t in cur_tracks.items if t is not None]
+                    except tekore.NotFound:
+                        pass
                     if cur_tracks:
-                        self.context_name = cur_tracks.name
+                        self.context_name = getattr(cur_tracks, "name", _("Saved Tracks"))
                     for track in tracks:
                         if track.id is not None:
                             self.select_options.append(track)
